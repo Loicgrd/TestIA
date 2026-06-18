@@ -15,8 +15,7 @@ st.sidebar.write("Générez rapidement le lien d'un dossier pour extraire son JS
 num_dossier = st.sidebar.text_input("Numéro de dossier (ex: T123272, CP123456...)")
 
 if num_dossier:
-    # Nettoyage automatique : on extrait uniquement les chiffres, 
-    # ce qui élimine automatiquement les préfixes T, CP, CPC, ou les espaces.
+    # Nettoyage automatique : on extrait uniquement les chiffres
     num_dossier_clean = re.sub(r'\D', '', num_dossier)
     
     if num_dossier_clean:
@@ -71,7 +70,7 @@ if uploaded_file is not None:
                         
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
                     
-                    # Liste des clés à exclure
+                    # Liste des clés à exclure (Mise à jour avec vos nouvelles exclusions)
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -83,12 +82,39 @@ if uploaded_file is not None:
                         "type_pose", "min_value_resistance", "soustraction_resistance_minvr", 
                         "is_age_batiment_plus_que_deux_ans_auto_filled",
                         "delta_temperature", "type_logement_and_chauffage", "systeme_chauffage_central",
-                        "ID Professionnel sous traitant"
+                        "ID Professionnel sous traitant", "type_logement", "type_emetteur_electrique"
                     ]
                     
                     # On isole les caractéristiques techniques utiles
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
                     
+                    # Traitement spécifique pour le tableau "Equipements" (ex: BAR-TH-158)
+                    if "Equipements" in tech_chars:
+                        eq_data = tech_chars["Equipements"]
+                        try:
+                            # Vérification de la structure du JSON Equipements
+                            if isinstance(eq_data, dict) and "values" in eq_data:
+                                values_str = eq_data["values"]
+                                # Conversion de la chaîne de caractères (string) en vraie liste Python
+                                eq_list = json.loads(values_str) if isinstance(values_str, str) else values_str
+                                
+                                formatted_eq = []
+                                for item in eq_list:
+                                    marque = item[0] if len(item) > 0 else ""
+                                    ref = item[1] if len(item) > 1 else ""
+                                    certif = item[2] if len(item) > 2 else ""
+                                    qte = item[3] if len(item) > 3 else ""
+                                    puis = item[4] if len(item) > 4 else ""
+                                    
+                                    # Formatage visuel clair
+                                    formatted_eq.append(f"• Marque: {marque} | Réf: {ref} | Certificat: {certif} | Qté: {qte} | Puissance: {puis} W")
+                                
+                                # Remplacement des données brutes par le texte formaté
+                                tech_chars["Equipements"] = "\n".join(formatted_eq)
+                        except Exception:
+                            # En cas d'erreur de format, on conserve la donnée brute
+                            pass
+
                     # Mapping spécifique de la valeur 'type_fenetre'
                     if "type_fenetre" in tech_chars:
                         if tech_chars["type_fenetre"] == 1:
