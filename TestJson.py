@@ -70,7 +70,7 @@ if uploaded_file is not None:
                         
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
                     
-                    # Liste des clés à exclure
+                    # Liste des clés à exclure (Mise à jour exhaustive)
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -82,13 +82,18 @@ if uploaded_file is not None:
                         "type_pose", "min_value_resistance", "soustraction_resistance_minvr", 
                         "is_age_batiment_plus_que_deux_ans_auto_filled",
                         "delta_temperature", "type_logement_and_chauffage", "systeme_chauffage_central",
-                        "ID Professionnel sous traitant", "type_logement", "type_emetteur_electrique"
+                        "ID Professionnel sous traitant", "type_logement", "type_emetteur_electrique",
+                        "marque_emetteurs", "reference_emetteurs", "is_multiple_entry",
+                        "surface_habitable_35", "surface_habitable_130", "surface_habitable_35_60",
+                        "surface_habitable_60_70", "surface_habitable_70_90", "surface_habitable_90_110",
+                        "surface_habitable_110_130", "max_puissance_collective", 
+                        "validate_value_for_type_caisson", "validate_choice_for_type_caisson"
                     ]
                     
                     # On isole les caractéristiques techniques utiles
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
                     
-                    # Extraction et suppression temporaire de "Equipements" pour traitement manuel
+                    # Extraction et suppression temporaire de "Equipements" pour traitement manuel (ex: BAR-TH-158)
                     equipements_list = []
                     if "Equipements" in tech_chars:
                         eq_data = tech_chars.pop("Equipements")
@@ -113,12 +118,34 @@ if uploaded_file is not None:
                         except Exception:
                             pass
 
-                    # Mapping spécifique de la valeur 'type_fenetre'
+                    # ----------------------------------------------------
+                    # MAPPINGS SPÉCIFIQUES (Traduction des codes en texte)
+                    # ----------------------------------------------------
+                    
+                    # Fenêtres
                     if "type_fenetre" in tech_chars:
                         if tech_chars["type_fenetre"] == 1:
                             tech_chars["type_fenetre"] = "Autres fenetres"
                         elif tech_chars["type_fenetre"] == 0:
                             tech_chars["type_fenetre"] = "Fenêtre de toiture"
+                            
+                    # Caissons de ventilation (BAR-TH-127)
+                    if "type_caisson" in tech_chars:
+                        if tech_chars["type_caisson"] == 2:
+                            tech_chars["type_caisson"] = "basse pression"
+                        elif tech_chars["type_caisson"] == 1:
+                            tech_chars["type_caisson"] = "basse consommation"
+                        elif tech_chars["type_caisson"] == 0:
+                            tech_chars["type_caisson"] = "standard"
+
+                    # Type de ventilation (BAR-TH-127)
+                    if "type_ventilation" in tech_chars:
+                        if tech_chars["type_ventilation"] == 0:
+                            tech_chars["type_ventilation"] = "hygro A"
+                        elif tech_chars["type_ventilation"] == 1:
+                            tech_chars["type_ventilation"] = "hygro B"
+                    
+                    # ----------------------------------------------------
                     
                     # Création de la ligne principale
                     base_row = {
@@ -130,18 +157,17 @@ if uploaded_file is not None:
                     
                     # Logique d'insertion avec ou sans équipements
                     if not equipements_list:
-                        # Cas classique : pas d'équipement spécifique à lister
+                        # Cas classique
                         records_by_fiche[fiche_ref].append(base_row)
                     else:
                         # Cas avec tableau (ex: BAR-TH-158)
-                        # Le 1er équipement est fusionné avec la ligne principale
                         first_row = {**base_row, **equipements_list[0]}
                         records_by_fiche[fiche_ref].append(first_row)
                         
-                        # Les équipements suivants génèrent de nouvelles lignes vides, sauf pour l'équipement
+                        # Les équipements suivants génèrent de nouvelles lignes (colonnes vides sauf équipement)
                         for eq in equipements_list[1:]:
-                            empty_row = {k: "" for k in base_row.keys()} # Création de colonnes vides
-                            empty_row.update(eq) # On n'y met QUE le nouvel équipement
+                            empty_row = {k: "" for k in base_row.keys()} 
+                            empty_row.update(eq) 
                             records_by_fiche[fiche_ref].append(empty_row)
         
         # 3. Affichage et Export Excel
