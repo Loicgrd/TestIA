@@ -40,7 +40,7 @@ if uploaded_file is not None:
         data = json.load(uploaded_file)
         dossier_id = data.get("id", "")
         st.success(f"Dossier {dossier_id} chargé avec succès !")
-            st.success(f"Dossier {dossier_id} chargé avec succès !")
+
 
         # 1. Extraction des dates globales au niveau du dossier
         date_eng = format_timestamp(data.get("dateEngagementReelle"))
@@ -252,4 +252,4 @@ if uploaded_file is not None:
             st.warning("Aucune fiche BAR n'a été trouvée dans ce JSON.")
             
     except Exception as e:
-        st.error(f"Erreur lors de la lecture du fichier : {e}")
+        st.error(f"Erreur lors de la lecture : {e}")
