@@ -82,7 +82,7 @@ if uploaded_file is not None:
                     else:
                         adresse = "Non renseignée"
                     
-                    # Liste des clés à exclure (Mise à jour avec vos nouvelles demandes)
+                    # Liste des clés à exclure
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -111,50 +111,68 @@ if uploaded_file is not None:
                     # ----------------------------------------------------
                     equipements_list = []
                     
-                    # Cas BAR-TH-158 : Tableau "Equipements"
-                    if "Equipements" in tech_chars:
-                        eq_data = tech_chars.pop("Equipements")
+                    # Détection insensible à la casse de la clé "Equipements" (ex: BAR-TH-158)
+                    eq_key = next((k for k in list(tech_chars.keys()) if k.lower() == "equipements"), None)
+                    if eq_key:
+                        eq_data = tech_chars.pop(eq_key)
                         try:
+                            # Parser de manière souple (dict, list ou string JSON)
                             if isinstance(eq_data, dict) and "values" in eq_data:
-                                values_str = eq_data["values"]
-                                eq_list = json.loads(values_str) if isinstance(values_str, str) else values_str
-                                for item in eq_list:
-                                    marque = item[0] if len(item) > 0 else ""
-                                    ref = item[1] if len(item) > 1 else ""
-                                    qte = item[3] if len(item) > 3 else ""
-                                    puis = item[4] if len(item) > 4 else ""
-                                    equipements_list.append({
-                                        "Éq. Marque": marque,
-                                        "Éq. Référence": ref,
-                                        "Éq. Quantité": qte,
-                                        "Éq. Puissance (W)": puis
-                                    })
+                                values_data = eq_data["values"]
+                                eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
+                            elif isinstance(eq_data, str):
+                                eq_list = json.loads(eq_data)
+                            elif isinstance(eq_data, list):
+                                eq_list = eq_data
+                            else:
+                                eq_list = []
+                                
+                            for item in eq_list:
+                                marque = item[0] if len(item) > 0 else ""
+                                ref = item[1] if len(item) > 1 else ""
+                                qte = item[3] if len(item) > 3 else ""
+                                puis = item[4] if len(item) > 4 else ""
+                                equipements_list.append({
+                                    "Éq. Marque": marque,
+                                    "Éq. Référence": ref,
+                                    "Éq. Quantité": qte,
+                                    "Éq. Puissance (W)": puis
+                                })
                         except Exception:
                             pass
 
-                    # Cas BAR-TH-106 : Tableau "puissance"
-                    if "puissance" in tech_chars and "BAR-TH-106" in str(fiche_ref).upper():
-                        eq_data = tech_chars.pop("puissance")
+                    # Détection insensible à la casse de la clé "Puissance" (ex: BAR-TH-106)
+                    puissance_key = next((k for k in list(tech_chars.keys()) if k.lower() == "puissance"), None)
+                    if puissance_key and "BAR-TH-106" in str(fiche_ref).upper():
+                        eq_data = tech_chars.pop(puissance_key)
                         try:
+                            # Parser de manière souple (dict, list ou string JSON)
                             if isinstance(eq_data, dict) and "values" in eq_data:
-                                values_str = eq_data["values"]
-                                eq_list = json.loads(values_str) if isinstance(values_str, str) else values_str
-                                for item in eq_list:
-                                    mr_chaudiere = item[0] if len(item) > 0 else ""
-                                    qte = item[1] if len(item) > 1 else ""
-                                    puis = item[2] if len(item) > 2 else ""
-                                    etas = item[3] if len(item) > 3 else ""
-                                    mr_regu = item[4] if len(item) > 4 else ""
-                                    classe_regu = item[5] if len(item) > 5 else ""
-                                    
-                                    equipements_list.append({
-                                        "Éq. M et R Chaudière": mr_chaudiere,
-                                        "Éq. Quantité": qte,
-                                        "Éq. Puissance": puis,
-                                        "Éq. ETAS": etas,
-                                        "Éq. M et R Régulateur": mr_regu,
-                                        "Éq. Classe régu": classe_regu
-                                    })
+                                values_data = eq_data["values"]
+                                eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
+                            elif isinstance(eq_data, str):
+                                eq_list = json.loads(eq_data)
+                            elif isinstance(eq_data, list):
+                                eq_list = eq_data
+                            else:
+                                eq_list = []
+                                
+                            for item in eq_list:
+                                mr_chaudiere = item[0] if len(item) > 0 else ""
+                                qte = item[1] if len(item) > 1 else ""
+                                puis = item[2] if len(item) > 2 else ""
+                                etas = item[3] if len(item) > 3 else ""
+                                mr_regu = item[4] if len(item) > 4 else ""
+                                classe_regu = item[5] if len(item) > 5 else ""
+                                
+                                equipements_list.append({
+                                    "Éq. M et R Chaudière": mr_chaudiere,
+                                    "Éq. Quantité": qte,
+                                    "Éq. Puissance": puis,
+                                    "Éq. ETAS": etas,
+                                    "Éq. M et R Régulateur": mr_regu,
+                                    "Éq. Classe régu": classe_regu
+                                })
                         except Exception:
                             pass
 
