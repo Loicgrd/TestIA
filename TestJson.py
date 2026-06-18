@@ -51,7 +51,6 @@ if uploaded_file is not None:
         col2.metric("Date de réalisation réelle", date_real if date_real else "Non renseignée")
         
         # 2. Parcours des sites et lots pour extraire les fiches BAR
-        # On utilise maintenant un dictionnaire pour grouper les lignes par type de fiche BAR
         records_by_fiche = {}
         
         for site in data.get("sites", []):
@@ -62,13 +61,12 @@ if uploaded_file is not None:
                 # Vérification si c'est une fiche BAR
                 if "BAR" in str(fiche_ref).upper():
                     
-                    # Initialisation de la liste pour cette fiche si elle n'existe pas encore
                     if fiche_ref not in records_by_fiche:
                         records_by_fiche[fiche_ref] = []
                         
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
                     
-                    # Liste des clés à exclure (Mise à jour)
+                    # Liste des clés à exclure (Mise à jour avec l'exclusion du sous-traitant)
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -79,49 +77,51 @@ if uploaded_file is not None:
                         "coefficient_zone_a", "energieChauffage", 
                         "type_pose", "min_value_resistance", "soustraction_resistance_minvr", 
                         "is_age_batiment_plus_que_deux_ans_auto_filled",
-                        "delta_temperature", "type_logement_and_chauffage", "systeme_chauffage_central"
+                        "delta_temperature", "type_logement_and_chauffage", "systeme_chauffage_central",
+                        "ID Professionnel sous traitant"
                     ]
                     
                     # On isole les caractéristiques techniques utiles
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
                     
-                    # Création de la ligne de base (on enlève la colonne Fiche BAR puisqu'elle sert de titre au tableau)
+                    # Mapping spécifique de la valeur 'type_fenetre'
+                    if "type_fenetre" in tech_chars:
+                        if tech_chars["type_fenetre"] == 1:
+                            tech_chars["type_fenetre"] = "Autres fenetres"
+                        elif tech_chars["type_fenetre"] == 0:
+                            tech_chars["type_fenetre"] = "Fenêtre de toiture"
+                    
+                    # Création de la ligne de base
                     row = {
                         "Adresse concernée": adresse,
                         "Date d'engagement": date_eng,
                         "Date de réalisation": date_real
                     }
                     
-                    # Ajout des caractéristiques techniques comme colonnes
+                    # Ajout des caractéristiques techniques nettoyées et mappées
                     row.update(tech_chars)
                     
                     # Ajout au groupe correspondant
                     records_by_fiche[fiche_ref].append(row)
         
-        # 3. Affichage et Export
+        # 3. Affichage et Export Excel
         if records_by_fiche:
             total_fiches = sum(len(lignes) for lignes in records_by_fiche.values())
             st.subheader(f"✅ {total_fiches} Opération(s) trouvée(s)")
             
-            # Préparation du fichier Excel en mémoire
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
                 
-                # Pour chaque type de fiche BAR (ex: BAR-EN-102, BAR-EN-104...)
                 for fiche, lignes in records_by_fiche.items():
-                    # Création du DataFrame spécifique
                     df = pd.DataFrame(lignes)
-                    df = df.fillna("") # Nettoyage des NaN
+                    df = df.fillna("")
                     
-                    # Affichage dans l'interface Streamlit
                     st.markdown(f"### 🏷️ Fiche : {fiche} ({len(lignes)} opérations)")
                     st.dataframe(df, use_container_width=True)
                     
-                    # Ajout d'un onglet dans le fichier Excel (limite de nom de feuille = 31 caractères)
                     nom_onglet = str(fiche)[:31]
                     df.to_excel(writer, index=False, sheet_name=nom_onglet)
             
-            # Option pour télécharger le fichier Excel avec ses multiples onglets
             nom_export = f'extraction_fiches_bar_T{dossier_id}.xlsx' if dossier_id else 'extraction_fiches_bar.xlsx'
             st.download_button(
                 label=f"📥 Télécharger le fichier Excel structuré par Fiches ({nom_export})",
