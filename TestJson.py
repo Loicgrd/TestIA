@@ -70,7 +70,7 @@ if uploaded_file is not None:
                         
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
                     
-                    # Liste des clés à exclure (Mise à jour avec vos nouvelles exclusions)
+                    # Liste des clés à exclure
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -88,31 +88,29 @@ if uploaded_file is not None:
                     # On isole les caractéristiques techniques utiles
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
                     
-                    # Traitement spécifique pour le tableau "Equipements" (ex: BAR-TH-158)
+                    # Extraction et suppression temporaire de "Equipements" pour traitement manuel
+                    equipements_list = []
                     if "Equipements" in tech_chars:
-                        eq_data = tech_chars["Equipements"]
+                        eq_data = tech_chars.pop("Equipements")
                         try:
-                            # Vérification de la structure du JSON Equipements
                             if isinstance(eq_data, dict) and "values" in eq_data:
                                 values_str = eq_data["values"]
-                                # Conversion de la chaîne de caractères (string) en vraie liste Python
                                 eq_list = json.loads(values_str) if isinstance(values_str, str) else values_str
                                 
-                                formatted_eq = []
                                 for item in eq_list:
+                                    # Index : 0=Marque, 1=Ref, 2=Certificat (ignoré), 3=Qté, 4=Puissance
                                     marque = item[0] if len(item) > 0 else ""
                                     ref = item[1] if len(item) > 1 else ""
-                                    certif = item[2] if len(item) > 2 else ""
                                     qte = item[3] if len(item) > 3 else ""
                                     puis = item[4] if len(item) > 4 else ""
                                     
-                                    # Formatage visuel clair
-                                    formatted_eq.append(f"• Marque: {marque} | Réf: {ref} | Certificat: {certif} | Qté: {qte} | Puissance: {puis} W")
-                                
-                                # Remplacement des données brutes par le texte formaté
-                                tech_chars["Equipements"] = "\n".join(formatted_eq)
+                                    equipements_list.append({
+                                        "Éq. Marque": marque,
+                                        "Éq. Référence": ref,
+                                        "Éq. Quantité": qte,
+                                        "Éq. Puissance (W)": puis
+                                    })
                         except Exception:
-                            # En cas d'erreur de format, on conserve la donnée brute
                             pass
 
                     # Mapping spécifique de la valeur 'type_fenetre'
@@ -122,23 +120,34 @@ if uploaded_file is not None:
                         elif tech_chars["type_fenetre"] == 0:
                             tech_chars["type_fenetre"] = "Fenêtre de toiture"
                     
-                    # Création de la ligne de base
-                    row = {
+                    # Création de la ligne principale
+                    base_row = {
                         "Adresse concernée": adresse,
                         "Date d'engagement": date_eng,
                         "Date de réalisation": date_real
                     }
+                    base_row.update(tech_chars) # On y fusionne les autres infos techniques
                     
-                    # Ajout des caractéristiques techniques nettoyées et mappées
-                    row.update(tech_chars)
-                    
-                    # Ajout au groupe correspondant
-                    records_by_fiche[fiche_ref].append(row)
+                    # Logique d'insertion avec ou sans équipements
+                    if not equipements_list:
+                        # Cas classique : pas d'équipement spécifique à lister
+                        records_by_fiche[fiche_ref].append(base_row)
+                    else:
+                        # Cas avec tableau (ex: BAR-TH-158)
+                        # Le 1er équipement est fusionné avec la ligne principale
+                        first_row = {**base_row, **equipements_list[0]}
+                        records_by_fiche[fiche_ref].append(first_row)
+                        
+                        # Les équipements suivants génèrent de nouvelles lignes vides, sauf pour l'équipement
+                        for eq in equipements_list[1:]:
+                            empty_row = {k: "" for k in base_row.keys()} # Création de colonnes vides
+                            empty_row.update(eq) # On n'y met QUE le nouvel équipement
+                            records_by_fiche[fiche_ref].append(empty_row)
         
         # 3. Affichage et Export Excel
         if records_by_fiche:
             total_fiches = sum(len(lignes) for lignes in records_by_fiche.values())
-            st.subheader(f"✅ {total_fiches} Opération(s) trouvée(s)")
+            st.subheader(f"✅ Opération(s) trouvée(s)")
             
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -147,7 +156,7 @@ if uploaded_file is not None:
                     df = pd.DataFrame(lignes)
                     df = df.fillna("")
                     
-                    st.markdown(f"### 🏷️ Fiche : {fiche} ({len(lignes)} opérations)")
+                    st.markdown(f"### 🏷️ Fiche : {fiche} ({len(lignes)} lignes)")
                     st.dataframe(df, use_container_width=True)
                     
                     nom_onglet = str(fiche)[:31]
