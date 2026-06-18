@@ -103,7 +103,8 @@ if uploaded_file is not None:
                         "reference_technique", "validate_requireds", "surface_habitable_70",
                         "batiment_age_plus_de_2_ans", "diff_nb_chaudiere_appartements" ,
                         "validate_conditions", "chaudiere_plus_que_deux_ans" ,
-                        "radiateurs_plus_que_deux_ans", "is_multiple_entry_auto_filled"
+                        "radiateurs_plus_que_deux_ans", "is_multiple_entry_auto_filled" ,
+                        "mise_en_place_pare_vapeur"
                     ]
                     
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
