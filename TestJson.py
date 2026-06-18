@@ -40,10 +40,8 @@ if uploaded_file is not None:
                 # Vérification si c'est une fiche BAR
                 if "BAR" in str(fiche_ref).upper():
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
-                    titre = form_data.get("titre", "")
                     
-                    # Filtrage des clés pour ne garder que les caractéristiques techniques
-                    # On exclut les champs administratifs, géographiques ou de volume
+                    # Liste des clés à exclure (Ajout de 'energieChauffage' comme demandé)
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -51,26 +49,35 @@ if uploaded_file is not None:
                         "complement_adresse", "count_html_block_A", "secteurApplication",
                         "nombreLogements", "nombreLogementsConventionnes", "age_batiment_plus_que_deux_ans",
                         "volume", "volumeClassique", "volumePrecarite", "professionnel_titulaire_signe_qualite",
-                        "coefficient_zone_a"
+                        "coefficient_zone_a", "energieChauffage"
                     ]
                     
-                    # Dictionnaire des caractéristiques techniques dynamiques (marque, UW, R, etc.)
+                    # On isole les caractéristiques techniques utiles
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
                     
-                    # Formatage des caractéristiques techniques en chaîne lisible
-                    tech_str = " | ".join([f"{k} : {v}" for k, v in tech_chars.items()])
-                    
-                    records.append({
+                    # Création de la ligne de base
+                    row = {
                         "Fiche BAR": fiche_ref,
-                        "Titre de l'opération": titre,
                         "Adresse concernée": adresse,
                         "Date d'engagement": date_eng,
-                        "Date de réalisation": date_real,
-                        "Caractéristiques techniques": tech_str
-                    })
+                        "Date de réalisation": date_real
+                    }
+                    
+                    # Fusion : on intègre chaque caractéristique technique comme une colonne distincte
+                    row.update(tech_chars)
+                    
+                    records.append(row)
         
         if records:
+            # Transformation en tableau (DataFrame)
             df = pd.DataFrame(records)
+            
+            # On remplace les valeurs "NaN" (Not a Number) générées par Pandas par des cases vides pour plus de propreté
+            df = df.fillna("")
+            
+            # Tri par Fiche BAR pour regrouper les opérations identiques
+            df = df.sort_values(by="Fiche BAR").reset_index(drop=True)
+            
             st.subheader(f"✅ {len(records)} Fiche(s) BAR trouvée(s)")
             st.dataframe(df, use_container_width=True)
             
@@ -79,7 +86,7 @@ if uploaded_file is not None:
             st.download_button(
                 label="📥 Télécharger le tableau en CSV",
                 data=csv,
-                file_name='extraction_fiches_bar.csv',
+                file_name='extraction_fiches_bar_colonnes.csv',
                 mime='text/csv',
             )
         else:
