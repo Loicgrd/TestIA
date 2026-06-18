@@ -101,7 +101,9 @@ if uploaded_file is not None:
                         "surface_habitable_110_130", "max_puissance_collective", 
                         "validate_value_for_type_caisson", "validate_choice_for_type_caisson",
                         "reference_technique", "validate_requireds", "surface_habitable_70",
-                        "batiment_age_plus_de_2_ans", "diff_nb_chaudiere_appartements"
+                        "batiment_age_plus_de_2_ans", "diff_nb_chaudiere_appartements" ,
+                        "validate_conditions", "chaudiere_plus_que_deux_ans" ,
+                        "radiateurs_plus_que_deux_ans"
                     ]
                     
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
