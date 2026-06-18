@@ -4,6 +4,7 @@ import pandas as pd
 from datetime import datetime
 import io
 import re
+import pytz
 
 st.set_page_config(page_title="Extracteur JSON - Fiches BAR (CEE)", layout="wide")
 
@@ -31,7 +32,11 @@ uploaded_file = st.file_uploader("Choisissez un fichier JSON", type="json")
 
 def format_timestamp(ts):
     if ts:
-        return datetime.fromtimestamp(ts / 1000.0).strftime('%d/%m/%Y')
+        # On définit le fuseau horaire français
+        paris_tz = pytz.timezone('Europe/Paris')
+        # On convertit le timestamp en appliquant directement le fuseau de Paris
+        dt = datetime.fromtimestamp(ts / 1000.0, paris_tz)
+        return dt.strftime('%d/%m/%Y')
     return None
 
 if uploaded_file is not None:
