@@ -3,6 +3,7 @@ import json
 import pandas as pd
 from datetime import datetime
 import io
+import re
 
 st.set_page_config(page_title="Extracteur JSON - Fiches BAR (CEE)", layout="wide")
 
@@ -11,14 +12,18 @@ st.set_page_config(page_title="Extracteur JSON - Fiches BAR (CEE)", layout="wide
 # ==========================================
 st.sidebar.header("🔗 Raccourci Odicee")
 st.sidebar.write("Générez rapidement le lien d'un dossier pour extraire son JSON :")
-num_dossier = st.sidebar.text_input("Numéro de dossier (ex: 123272)")
+num_dossier = st.sidebar.text_input("Numéro de dossier (ex: T123272, CP123456...)")
 
 if num_dossier:
-    num_dossier_clean = num_dossier.upper().replace("T", "").strip()
-    lien = f"https://odicee.edf.fr/api/dossiers/{num_dossier_clean}"
+    # Nettoyage automatique : on extrait uniquement les chiffres, 
+    # ce qui élimine automatiquement les préfixes T, CP, CPC, ou les espaces.
+    num_dossier_clean = re.sub(r'\D', '', num_dossier)
     
-    st.sidebar.markdown(f"**[➡️ Ouvrir le JSON du T{num_dossier_clean}]({lien})**")
-    st.sidebar.caption("Astuce : Sur la nouvelle page, faites *Ctrl + S* pour sauvegarder le fichier, puis importez-le au centre de cette page.")
+    if num_dossier_clean:
+        lien = f"https://odicee.edf.fr/api/dossiers/{num_dossier_clean}"
+        
+        st.sidebar.markdown(f"**[➡️ Ouvrir le JSON du dossier {num_dossier_clean}]({lien})**")
+        st.sidebar.caption("Astuce : Sur la nouvelle page, faites *Ctrl + S* pour sauvegarder le fichier, puis importez-le au centre de cette page.")
 
 # ==========================================
 # CORPS DE L'APPLICATION
@@ -39,7 +44,7 @@ if uploaded_file is not None:
         
         dossier_id = data.get("id", "")
         if dossier_id:
-            st.success(f"Dossier T{dossier_id} chargé avec succès !")
+            st.success(f"Dossier {dossier_id} chargé avec succès !")
 
         # 1. Extraction des dates globales au niveau du dossier
         date_eng = format_timestamp(data.get("dateEngagementReelle"))
@@ -66,7 +71,7 @@ if uploaded_file is not None:
                         
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
                     
-                    # Liste des clés à exclure (Mise à jour avec l'exclusion du sous-traitant)
+                    # Liste des clés à exclure
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -122,7 +127,7 @@ if uploaded_file is not None:
                     nom_onglet = str(fiche)[:31]
                     df.to_excel(writer, index=False, sheet_name=nom_onglet)
             
-            nom_export = f'extraction_fiches_bar_T{dossier_id}.xlsx' if dossier_id else 'extraction_fiches_bar.xlsx'
+            nom_export = f'extraction_fiches_bar_{dossier_id}.xlsx' if dossier_id else 'extraction_fiches_bar.xlsx'
             st.download_button(
                 label=f"📥 Télécharger le fichier Excel structuré par Fiches ({nom_export})",
                 data=output.getvalue(),
