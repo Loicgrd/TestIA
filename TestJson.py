@@ -5,6 +5,24 @@ from datetime import datetime
 
 st.set_page_config(page_title="Extracteur JSON - Fiches BAR (CEE)", layout="wide")
 
+# ==========================================
+# BARRE LATÉRALE : RACCOURCI DE TÉLÉCHARGEMENT
+# ==========================================
+st.sidebar.header("🔗 Raccourci Odicee")
+st.sidebar.write("Générez rapidement le lien d'un dossier pour extraire son JSON :")
+num_dossier = st.sidebar.text_input("Numéro de dossier (ex: 123272)")
+
+if num_dossier:
+    # Nettoyage automatique si vous copiez-collez avec le "T" devant
+    num_dossier_clean = num_dossier.upper().replace("T", "").strip()
+    lien = f"https://odicee.edf.fr/api/dossiers/{num_dossier_clean}"
+    
+    st.sidebar.markdown(f"**[➡️ Ouvrir le JSON du T{num_dossier_clean}]({lien})**")
+    st.sidebar.caption("Astuce : Sur la nouvelle page, faites *Ctrl + S* pour sauvegarder le fichier, puis importez-le au centre de cette page.")
+
+# ==========================================
+# CORPS DE L'APPLICATION
+# ==========================================
 st.title("📄 Extracteur de données JSON - Dossiers CEE")
 st.write("Importez votre fichier JSON pour extraire automatiquement les valeurs des fiches BAR.")
 
@@ -12,7 +30,6 @@ uploaded_file = st.file_uploader("Choisissez un fichier JSON", type="json")
 
 def format_timestamp(ts):
     if ts:
-        # Les timestamps sont souvent en millisecondes dans ces JSON
         return datetime.fromtimestamp(ts / 1000.0).strftime('%d/%m/%Y')
     return None
 
@@ -20,6 +37,11 @@ if uploaded_file is not None:
     try:
         data = json.load(uploaded_file)
         
+        # Récupération de l'ID du dossier pour affichage et nom de fichier
+        dossier_id = data.get("id", "")
+        if dossier_id:
+            st.success(f"Dossier T{dossier_id} chargé avec succès !")
+
         # 1. Extraction des dates globales au niveau du dossier
         date_eng = format_timestamp(data.get("dateEngagementReelle"))
         date_real = format_timestamp(data.get("dateRealisationReelle"))
@@ -41,7 +63,7 @@ if uploaded_file is not None:
                 if "BAR" in str(fiche_ref).upper():
                     adresse = form_data.get("adresse_travaux", "Non renseignée")
                     
-                    # Liste des clés à exclure (Ajout de 'energieChauffage' comme demandé)
+                    # Liste des clés à exclure (Mise à jour avec vos nouvelles demandes)
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -49,7 +71,9 @@ if uploaded_file is not None:
                         "complement_adresse", "count_html_block_A", "secteurApplication",
                         "nombreLogements", "nombreLogementsConventionnes", "age_batiment_plus_que_deux_ans",
                         "volume", "volumeClassique", "volumePrecarite", "professionnel_titulaire_signe_qualite",
-                        "coefficient_zone_a", "energieChauffage"
+                        "coefficient_zone_a", "energieChauffage", 
+                        "type_pose", "min_value_resistance", "soustraction_resistance_minvr", 
+                        "is_age_batiment_plus_que_deux_ans_auto_filled"
                     ]
                     
                     # On isole les caractéristiques techniques utiles
@@ -72,7 +96,7 @@ if uploaded_file is not None:
             # Transformation en tableau (DataFrame)
             df = pd.DataFrame(records)
             
-            # On remplace les valeurs "NaN" (Not a Number) générées par Pandas par des cases vides pour plus de propreté
+            # On remplace les valeurs NaN par des cases vides
             df = df.fillna("")
             
             # Tri par Fiche BAR pour regrouper les opérations identiques
@@ -82,11 +106,12 @@ if uploaded_file is not None:
             st.dataframe(df, use_container_width=True)
             
             # Option pour télécharger les données extraites en CSV
+            nom_export = f'extraction_fiches_bar_T{dossier_id}.csv' if dossier_id else 'extraction_fiches_bar.csv'
             csv = df.to_csv(index=False, sep=";").encode('utf-8-sig')
             st.download_button(
-                label="📥 Télécharger le tableau en CSV",
+                label=f"📥 Télécharger le tableau en CSV ({nom_export})",
                 data=csv,
-                file_name='extraction_fiches_bar_colonnes.csv',
+                file_name=nom_export,
                 mime='text/csv',
             )
         else:
