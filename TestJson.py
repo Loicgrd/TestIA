@@ -11,36 +11,36 @@ st.set_page_config(page_title="Extracteur JSON - Fiches BAR (CEE)", layout="wide
 # BARRE LATÉRALE : RACCOURCI DE TÉLÉCHARGEMENT
 # ==========================================
 st.sidebar.header("🔗 Raccourci Odicee")
+st.sidebar.write("Générez rapidement le lien d'un dossier pour extraire son JSON :")
 num_dossier = st.sidebar.text_input("Numéro de dossier (ex: T123272, CP123456...)")
 
 if num_dossier:
     num_dossier_clean = re.sub(r'\D', '', num_dossier)
     if num_dossier_clean:
-        lien_api = f"https://odicee.edf.fr/api/dossiers/{num_dossier_clean}"
-        
-        st.sidebar.write("1. Accès direct au fichier :")
-        # Ce bouton vous redirige vers l'URL. Si non connecté, Odicee vous redirige vers le login.
-        st.sidebar.link_button("📥 Ouvrir / Télécharger le JSON", lien_api)
-        
-        st.sidebar.divider()
-        st.sidebar.write("2. Analyse :")
+        lien = f"https://odicee.edf.fr/api/dossiers/{num_dossier_clean}"
+        st.sidebar.markdown(f"**[➡️ Ouvrir le JSON du dossier {num_dossier_clean}]({lien})**")
+        st.sidebar.caption("Astuce : Sur la nouvelle page, faites *Ctrl + S* pour sauvegarder le fichier, puis importez-le au centre de cette page.")
 
 # ==========================================
 # CORPS DE L'APPLICATION
 # ==========================================
 st.title("📄 Extracteur de données JSON - Dossiers CEE")
-uploaded_file = st.file_uploader("Glissez le JSON ici après téléchargement", type="json")
+st.write("Importez votre fichier JSON pour extraire automatiquement les valeurs des fiches BAR par type d'opération.")
 
+uploaded_file = st.file_uploader("Choisissez un fichier JSON", type="json")
 
 def format_timestamp(ts):
-    return datetime.fromtimestamp(ts / 1000.0).strftime('%d/%m/%Y') if ts else None
+    if ts:
+        return datetime.fromtimestamp(ts / 1000.0).strftime('%d/%m/%Y')
+    return None
 
 if uploaded_file is not None:
     try:
         data = json.load(uploaded_file)
+        
         dossier_id = data.get("id", "")
-        st.success(f"Dossier {dossier_id} chargé avec succès !")
-
+        if dossier_id:
+            st.success(f"Dossier {dossier_id} chargé avec succès !")
 
         # 1. Extraction des dates globales au niveau du dossier
         date_eng = format_timestamp(data.get("dateEngagementReelle"))
@@ -254,4 +254,4 @@ if uploaded_file is not None:
             st.warning("Aucune fiche BAR n'a été trouvée dans ce JSON.")
             
     except Exception as e:
-        st.error(f"Erreur lors de la lecture : {e}")
+        st.error(f"Erreur lors de la lecture du fichier : {e}")
