@@ -58,6 +58,16 @@ if uploaded_file is not None:
         records_by_fiche = {}
         
         for site in data.get("sites", []):
+            
+            # --- NOUVEAUTÉ : Récupération de l'adresse globale du Site en secours ---
+            numero_site = site.get("numero", "")
+            voie_site = site.get("nomVoie", "")
+            cp_site = site.get("codePostal", "")
+            ville_site = site.get("ville", "")
+            parts_site = [str(x) for x in [numero_site, voie_site, cp_site, ville_site] if x]
+            adresse_globale_site = " ".join(parts_site)
+            # -------------------------------------------------------------------------
+            
             for lot in site.get("lotsTravaux", []):
                 form_data = lot.get("formData", {})
                 fiche_ref = form_data.get("reference", "")
@@ -68,9 +78,17 @@ if uploaded_file is not None:
                     if fiche_ref not in records_by_fiche:
                         records_by_fiche[fiche_ref] = []
                         
-                    adresse = form_data.get("adresse_travaux", "Non renseignée")
+                    # --- NOUVEAUTÉ : Mécanisme de choix de l'adresse ---
+                    adresse_form = form_data.get("adresse_travaux", "").strip()
+                    if adresse_form:
+                        adresse = adresse_form # On prend l'adresse spécifique s'il y en a une
+                    elif adresse_globale_site:
+                        adresse = adresse_globale_site # Sinon, on prend l'adresse globale du Site
+                    else:
+                        adresse = "Non renseignée"
+                    # ---------------------------------------------------
                     
-                    # Liste des clés à exclure (Mise à jour exhaustive)
+                    # Liste des clés à exclure
                     exclude_keys = [
                         "sme", "titre", "ville", "version", "Altitude", "reference", 
                         "code_postal", "departement", "zoneClimatique", "adresse_travaux", 
@@ -87,13 +105,14 @@ if uploaded_file is not None:
                         "surface_habitable_35", "surface_habitable_130", "surface_habitable_35_60",
                         "surface_habitable_60_70", "surface_habitable_70_90", "surface_habitable_90_110",
                         "surface_habitable_110_130", "max_puissance_collective", 
-                        "validate_value_for_type_caisson", "validate_choice_for_type_caisson"
+                        "validate_value_for_type_caisson", "validate_choice_for_type_caisson",
+                        "reference_technique" # <-- Ajout de votre dernière exclusion ici
                     ]
                     
                     # On isole les caractéristiques techniques utiles
                     tech_chars = {k: v for k, v in form_data.items() if k not in exclude_keys and v is not None}
                     
-                    # Extraction et suppression temporaire de "Equipements" pour traitement manuel (ex: BAR-TH-158)
+                    # Extraction et suppression temporaire de "Equipements" pour traitement manuel
                     equipements_list = []
                     if "Equipements" in tech_chars:
                         eq_data = tech_chars.pop("Equipements")
@@ -118,18 +137,13 @@ if uploaded_file is not None:
                         except Exception:
                             pass
 
-                    # ----------------------------------------------------
-                    # MAPPINGS SPÉCIFIQUES (Traduction des codes en texte)
-                    # ----------------------------------------------------
-                    
-                    # Fenêtres
+                    # MAPPINGS SPÉCIFIQUES
                     if "type_fenetre" in tech_chars:
                         if tech_chars["type_fenetre"] == 1:
                             tech_chars["type_fenetre"] = "Autres fenetres"
                         elif tech_chars["type_fenetre"] == 0:
                             tech_chars["type_fenetre"] = "Fenêtre de toiture"
                             
-                    # Caissons de ventilation (BAR-TH-127)
                     if "type_caisson" in tech_chars:
                         if tech_chars["type_caisson"] == 2:
                             tech_chars["type_caisson"] = "basse pression"
@@ -138,14 +152,11 @@ if uploaded_file is not None:
                         elif tech_chars["type_caisson"] == 0:
                             tech_chars["type_caisson"] = "standard"
 
-                    # Type de ventilation (BAR-TH-127)
                     if "type_ventilation" in tech_chars:
                         if tech_chars["type_ventilation"] == 0:
                             tech_chars["type_ventilation"] = "hygro A"
                         elif tech_chars["type_ventilation"] == 1:
                             tech_chars["type_ventilation"] = "hygro B"
-                    
-                    # ----------------------------------------------------
                     
                     # Création de la ligne principale
                     base_row = {
@@ -153,18 +164,15 @@ if uploaded_file is not None:
                         "Date d'engagement": date_eng,
                         "Date de réalisation": date_real
                     }
-                    base_row.update(tech_chars) # On y fusionne les autres infos techniques
+                    base_row.update(tech_chars)
                     
                     # Logique d'insertion avec ou sans équipements
                     if not equipements_list:
-                        # Cas classique
                         records_by_fiche[fiche_ref].append(base_row)
                     else:
-                        # Cas avec tableau (ex: BAR-TH-158)
                         first_row = {**base_row, **equipements_list[0]}
                         records_by_fiche[fiche_ref].append(first_row)
                         
-                        # Les équipements suivants génèrent de nouvelles lignes (colonnes vides sauf équipement)
                         for eq in equipements_list[1:]:
                             empty_row = {k: "" for k in base_row.keys()} 
                             empty_row.update(eq) 
