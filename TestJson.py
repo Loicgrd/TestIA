@@ -219,10 +219,6 @@ if uploaded_file is not None:
                         
                         surface_habitable = (
                             form_data.get("surface_habitable") or 
-                            form_data.get("surface_habitable_70") or 
-                            form_data.get("surface") or
-                            exceptions.get("surface_habitable") or 
-                            exceptions.get("surface_habitable_70") or 
                             0
                         )
                         tech_chars["Surface Habitable (m²)"] = surface_habitable
