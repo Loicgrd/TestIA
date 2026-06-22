@@ -124,7 +124,6 @@ if uploaded_file is not None:
                     if eq_key:
                         eq_data = tech_chars.pop(eq_key)
                         try:
-                            # Parser de manière souple (dict, list ou string JSON)
                             if isinstance(eq_data, dict) and "values" in eq_data:
                                 values_data = eq_data["values"]
                                 eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
@@ -153,8 +152,8 @@ if uploaded_file is not None:
                     puissance_key = next((k for k in list(tech_chars.keys()) if k.lower() == "puissance"), None)
                     if puissance_key and "BAR-TH-106" in str(fiche_ref).upper():
                         eq_data = tech_chars.pop(puissance_key)
+                        mapping_classe = {0: "IV", 1: "V", 2: "VI", 3: "VII", 4: "VIII"} # Mapping pour le tableau imbriqué
                         try:
-                            # Parser de manière souple (dict, list ou string JSON)
                             if isinstance(eq_data, dict) and "values" in eq_data:
                                 values_data = eq_data["values"]
                                 eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
@@ -171,7 +170,13 @@ if uploaded_file is not None:
                                 puis = item[2] if len(item) > 2 else ""
                                 etas = item[3] if len(item) > 3 else ""
                                 mr_regu = item[4] if len(item) > 4 else ""
-                                classe_regu = item[5] if len(item) > 5 else ""
+                                
+                                # Traduction de la classe du régulateur dans le tableau
+                                classe_regu_brute = item[5] if len(item) > 5 else ""
+                                if str(classe_regu_brute).isdigit():
+                                    classe_regu = mapping_classe.get(int(classe_regu_brute), classe_regu_brute)
+                                else:
+                                    classe_regu = classe_regu_brute
                                 
                                 equipements_list.append({
                                     "Éq. M et R Chaudière": mr_chaudiere,
@@ -207,6 +212,47 @@ if uploaded_file is not None:
                         elif tech_chars["type_ventilation"] == 1:
                             tech_chars["type_ventilation"] = "hygro B"
                     
+                    # --- AJOUT: GESTION SPÉCIFIQUE BAR-TH-106 ---
+                    if "BAR-TH-106" in str(fiche_ref).upper():
+                        # 1. Surface Habitable (recherche dans les exceptions globales incluses)
+                        exceptions = form_data.get("exceptions_globales") or form_data.get("exceptionsGlobales") or {}
+                        
+                        surface_habitable = (
+                            form_data.get("surface_habitable") or 
+                            form_data.get("surface_habitable_70") or 
+                            form_data.get("surface") or
+                            exceptions.get("surface_habitable") or 
+                            exceptions.get("surface_habitable_70") or 
+                            0
+                        )
+                        tech_chars["Surface Habitable (m²)"] = surface_habitable
+                        
+                        # Nettoyage pour éviter les colonnes en double
+                        for k in ["surface_habitable", "surface_habitable_70", "surface"]:
+                            tech_chars.pop(k, None)
+
+                        # 2. Type de logement (Appartement = 0)
+                        type_logement = form_data.get("type_logement")
+                        
+                        # On supprime systématiquement les données brutes pour éviter des colonnes parasites
+                        tech_chars.pop("nombre_appartement", None)
+                        tech_chars.pop("puissance_nominale", None)
+                        
+                        if type_logement == 0:
+                            # C'est un appartement -> on ajoute les colonnes avec des jolis noms
+                            tech_chars["Nombre d'appartements"] = form_data.get("nombre_appartement", 0)
+                            tech_chars["Puissance Nominale (kW)"] = form_data.get("puissance_nominale", 0)
+
+                        # 3. Classe du régulateur (si l'info n'est pas dans le tableau mais stockée à la racine)
+                        mapping_classe = {0: "IV", 1: "V", 2: "VI", 3: "VII", 4: "VIII"}
+                        for key_classe in ["classe_regulateur", "classe_regulation"]:
+                            if key_classe in tech_chars:
+                                val = tech_chars.pop(key_classe)
+                                if val is not None and str(val).isdigit():
+                                    tech_chars["Classe du Régulateur"] = mapping_classe.get(int(val), f"Inconnue ({val})")
+                                else:
+                                    tech_chars["Classe du Régulateur"] = val
+
                     # ----------------------------------------------------
                     # CRÉATION DES LIGNES (Avec ou sans équipements)
                     # ----------------------------------------------------
