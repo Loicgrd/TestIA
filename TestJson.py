@@ -210,12 +210,21 @@ if uploaded_file is not None:
                     # ----------------------------------------------------
                     # CRÉATION DES LIGNES (Avec ou sans équipements)
                     # ----------------------------------------------------
+                    
+                    # Extraire surface_fenetres avant update pour le placer en dernière colonne
+                    # (présent uniquement sur certaines versions de BAR-EN-104)
+                    surface_fenetres = tech_chars.pop("surface_fenetres", None)
+                    
                     base_row = {
                         "Adresse concernée": adresse,
                         "Date d'engagement": date_eng,
                         "Date de réalisation": date_real
                     }
-                    base_row.update(tech_chars) 
+                    base_row.update(tech_chars)
+                    
+                    # Réinjecter en fin de dict pour que la colonne apparaisse toujours en dernier
+                    if surface_fenetres is not None:
+                        base_row["surface_fenetres"] = surface_fenetres 
                     
                     if not equipements_list:
                         # Cas classique
