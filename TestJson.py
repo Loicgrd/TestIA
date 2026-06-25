@@ -41,8 +41,14 @@ def format_timestamp(ts):
 # MAPPINGS PAR FICHE
 # ==========================================
 
-def apply_mappings(fiche_ref, tech_chars):
-    """Applique les mappings de valeurs selon la fiche concernée."""
+SEUIL_BAR_EN_104_V2 = datetime(2024, 1, 1, tzinfo=pytz.timezone('Europe/Paris'))
+
+def apply_mappings(fiche_ref, tech_chars, date_eng_ts=None):
+    """Applique les mappings de valeurs selon la fiche concernée.
+    
+    date_eng_ts : timestamp brut (ms) de dateEngagementReelle, utilisé pour
+                  les mappings dont la signification dépend de la version du formulaire.
+    """
     ref_upper = str(fiche_ref).upper()
 
     # BAR-EN-101 : type_pose
@@ -51,15 +57,22 @@ def apply_mappings(fiche_ref, tech_chars):
             val = tech_chars["type_pose"]
             tech_chars["type_pose"] = "En combles perdus" if val == 0 else "En rampant de toiture" if val == 1 else val
 
-    # BAR-EN-104 : type_fenetre (0=Fenêtre de toiture, 1=Double(s) fenêtre(s), 2=Autre(s) fenêtre(s))
+    # BAR-EN-104 : type_fenetre
+    # Avant 01/01/2024 : 0=Fenêtre de toiture, 1=Autre(s) fenêtre(s)
+    # À partir du 01/01/2024 : 0=Fenêtre de toiture, 1=Double(s) fenêtre(s), 2=Autre(s) fenêtre(s)
     if "BAR-EN-104" in ref_upper:
         if "type_fenetre" in tech_chars:
             val = tech_chars["type_fenetre"]
+            paris_tz = pytz.timezone('Europe/Paris')
+            eng_dt = datetime.fromtimestamp(date_eng_ts / 1000.0, paris_tz) if date_eng_ts else None
+            nouvelle_version = eng_dt is not None and eng_dt >= SEUIL_BAR_EN_104_V2
+
             if val == 0:
                 tech_chars["type_fenetre"] = "Fenêtre de toiture"
             elif val == 1:
-                tech_chars["type_fenetre"] = "Double(s) fenêtre(s)"
+                tech_chars["type_fenetre"] = "Double(s) fenêtre(s)" if nouvelle_version else "Autre(s) fenêtre(s)"
             elif val == 2:
+                # Valeur 2 n'existe qu'en nouvelle version
                 tech_chars["type_fenetre"] = "Autre(s) fenêtre(s)"
 
         # Marque : marque_fenetre OU marque_isolant
@@ -228,8 +241,10 @@ if uploaded_file is not None:
             st.success(f"Dossier {dossier_id} chargé avec succès !")
 
         # 1. Extraction des dates globales
-        date_eng  = format_timestamp(data.get("dateEngagementReelle"))
-        date_real = format_timestamp(data.get("dateRealisationReelle"))
+        date_eng_ts  = data.get("dateEngagementReelle")   # timestamp brut (ms) pour les mappings versionnés
+        date_real_ts = data.get("dateRealisationReelle")
+        date_eng  = format_timestamp(date_eng_ts)
+        date_real = format_timestamp(date_real_ts)
 
         st.subheader("🗓️ Dates du dossier")
         col1, col2 = st.columns(2)
@@ -303,7 +318,7 @@ if uploaded_file is not None:
                 # ---------------------------------------------------
                 # MAPPINGS DE VALEURS
                 # ---------------------------------------------------
-                tech_chars = apply_mappings(fiche_ref, tech_chars)
+                tech_chars = apply_mappings(fiche_ref, tech_chars, date_eng_ts)
 
                 # ---------------------------------------------------
                 # CONSTRUCTION DES LIGNES
