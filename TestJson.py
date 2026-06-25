@@ -259,9 +259,29 @@ EXCLUDE_KEYS = {
     "resistance_thermique_non_exported",  # remplacée par resistance_thermique dans BAR-EN-105
 }
 
-# type_pose est géré via mapping, on le retire de l'exclusion globale pour BAR-EN-101
-# (on le réintègre dans apply_mappings)
+# ==========================================
+# EXCLUSIONS SPÉCIFIQUES PAR FICHE
+# Principe : EXCLUDE_KEYS contient les clés à exclure pour TOUTES les fiches.
+# Quand une clé doit être exclue (ou réintégrée) uniquement pour une fiche précise,
+# on construit un set dérivé ici et on le sélectionne dans la boucle via get_exclude_set().
+# ==========================================
+
+# BAR-EN-101 : type_pose réintégré (exclu globalement car inutile ailleurs,
+#              mais nécessaire ici pour le mapping En combles perdus / Rampant de toiture)
 EXCLUDE_KEYS_WITHOUT_TYPE_POSE = EXCLUDE_KEYS - {"type_pose"}
+
+# BAR-EN-102 : type_logement et energie_chauffage à exclure en plus du set global
+#              (champs présents dans le formData mais non pertinents pour cette fiche)
+EXCLUDE_KEYS_BAR_EN_102 = EXCLUDE_KEYS | {"type_logement", "energie_chauffage"}
+
+
+def get_exclude_set(ref_upper):
+    """Retourne le set d'exclusion adapté à la fiche détectée."""
+    if "BAR-EN-101" in ref_upper:
+        return EXCLUDE_KEYS_WITHOUT_TYPE_POSE
+    if "BAR-EN-102" in ref_upper:
+        return EXCLUDE_KEYS_BAR_EN_102
+    return EXCLUDE_KEYS
 
 
 if uploaded_file is not None:
@@ -326,8 +346,7 @@ if uploaded_file is not None:
                 # ---------------------------------------------------
                 ref_upper = str(fiche_ref).upper()
 
-                # Pour BAR-EN-101, type_pose doit passer (il sera mappé)
-                exclude_set = EXCLUDE_KEYS_WITHOUT_TYPE_POSE if "BAR-EN-101" in ref_upper else EXCLUDE_KEYS
+                exclude_set = get_exclude_set(ref_upper)
 
                 tech_chars = {
                     k: v for k, v in form_data.items()
