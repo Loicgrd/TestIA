@@ -120,11 +120,16 @@ def apply_mappings(fiche_ref, tech_chars, date_eng_ts=None):
             val = tech_chars["type_ventilation"]
             tech_chars["type_ventilation"] = "hygro A" if val == 0 else "hygro B" if val == 1 else val
 
+        if "classe_energetique" in tech_chars:
+            val = tech_chars["classe_energetique"]
+            tech_chars["classe_energetique"] = {0: "A+", 1: "A", 2: "B"}.get(val, val)
+
     return tech_chars
 
 
 def extract_equipements_th158(tech_chars):
     """BAR-TH-158 : tableau Equipements multi-lignes (marque, ref, qté, puissance)."""
+    tech_chars.pop("type_logement", None)
     equipements_list = []
     eq_key = next((k for k in list(tech_chars.keys()) if k.lower() == "equipements"), None)
     if eq_key:
