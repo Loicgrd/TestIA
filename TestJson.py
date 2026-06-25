@@ -152,54 +152,76 @@ def extract_equipements_th158(tech_chars):
     return equipements_list
 
 
+# Clés à exclure uniquement en mode individuel pour BAR-TH-106
+EXCLUDE_TH106_INDIVIDUEL = {"puissance_thermique_nominale", "nombre_d_appartement", "nb_equipements"}
+
+# Mapping classe_regulateur (menu déroulant Odicee) → classe ErP
+CLASSE_REGULATEUR_MAP = {0: "IV", 1: "V", 2: "VI", 3: "VII", 4: "VIII"}
+
 def extract_equipements_th106(tech_chars):
     """
     BAR-TH-106 : deux cas selon type_logement.
-      - Individuel (type_logement == 1) : champs directs dans formData
-        (marque_chaudiere, reference_chaudiere, puissance_thermique_nominale,
-         efficacite_energetique, marque_regulateur, reference_regulateur,
-         classe_regulateur, surface_habitable)
-      - Collectif  (type_logement == 2) : tableau Puissance.values[i]
-    Dans les deux cas, la clé brute "Puissance" est retirée de tech_chars.
+      - Individuel (type_logement == 1) : champs directs dans formData.
+        Les clés puissance_thermique_nominale, nombre_d_appartement, nb_equipements
+        sont supprimées. classe_regulateur est traduit (0→IV … 4→VIII).
+        La clé Puissance (tableau vide) est supprimée.
+      - Collectif  (type_logement == 2) : tableau Puissance.values[i] parsé
+        en lignes d'équipements. La clé Puissance est conservée pour parsing
+        puis supprimée.
+    type_logement est traduit en libellé dans les deux cas.
     Retourne (equipements_list, est_collectif).
     """
     equipements_list = []
     type_logement = tech_chars.get("type_logement")
     est_collectif = (type_logement == 2)
 
-    # Supprimer la clé "Puissance" dans tous les cas (tableau collectif ou vide en individuel)
+    # Traduire type_logement en libellé lisible
+    if "type_logement" in tech_chars:
+        tech_chars["type_logement"] = "Collectif" if est_collectif else "Individuel"
+
+    if not est_collectif:
+        # --- CAS INDIVIDUEL ---
+        # Supprimer les champs non pertinents en individuel
+        for k in EXCLUDE_TH106_INDIVIDUEL:
+            tech_chars.pop(k, None)
+        # Mapper classe_regulateur (menu déroulant → classe ErP)
+        if "classe_regulateur" in tech_chars:
+            val = tech_chars["classe_regulateur"]
+            tech_chars["classe_regulateur"] = CLASSE_REGULATEUR_MAP.get(val, val)
+        # Supprimer la clé Puissance si présente (tableau vide en individuel)
+        puissance_key = next((k for k in list(tech_chars.keys()) if k.lower() == "puissance"), None)
+        if puissance_key:
+            tech_chars.pop(puissance_key)
+        return equipements_list, False
+
+    # --- CAS COLLECTIF ---
     puissance_key = next((k for k in list(tech_chars.keys()) if k.lower() == "puissance"), None)
     if puissance_key:
         eq_data = tech_chars.pop(puissance_key)
+        try:
+            if isinstance(eq_data, dict) and "values" in eq_data:
+                values_data = eq_data["values"]
+                eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
+            elif isinstance(eq_data, str):
+                eq_list = json.loads(eq_data)
+            elif isinstance(eq_data, list):
+                eq_list = eq_data
+            else:
+                eq_list = []
 
-        if est_collectif:
-            # Cas collectif : parser le tableau
-            try:
-                if isinstance(eq_data, dict) and "values" in eq_data:
-                    values_data = eq_data["values"]
-                    eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
-                elif isinstance(eq_data, str):
-                    eq_list = json.loads(eq_data)
-                elif isinstance(eq_data, list):
-                    eq_list = eq_data
-                else:
-                    eq_list = []
+            for item in eq_list:
+                equipements_list.append({
+                    "Éq. M et R Chaudière":  item[0] if len(item) > 0 else "",
+                    "Éq. Quantité":          item[1] if len(item) > 1 else "",
+                    "Éq. Puissance (kW)":    item[2] if len(item) > 2 else "",
+                    "Éq. ETAS (%)":          item[3] if len(item) > 3 else "",
+                    "Éq. M et R Régulateur": item[4] if len(item) > 4 else "",
+                    "Éq. Classe régu":       item[5] if len(item) > 5 else ""
+                })
+        except Exception:
+            pass
 
-                for item in eq_list:
-                    equipements_list.append({
-                        "Éq. M et R Chaudière":  item[0] if len(item) > 0 else "",
-                        "Éq. Quantité":          item[1] if len(item) > 1 else "",
-                        "Éq. Puissance (kW)":    item[2] if len(item) > 2 else "",
-                        "Éq. ETAS (%)":          item[3] if len(item) > 3 else "",
-                        "Éq. M et R Régulateur": item[4] if len(item) > 4 else "",
-                        "Éq. Classe régu":       item[5] if len(item) > 5 else ""
-                    })
-            except Exception:
-                pass
-        # Cas individuel : on a juste supprimé la clé Puissance (tableau vide/inutile),
-        # les vrais champs sont déjà dans tech_chars
-
-    return equipements_list, est_collectif
+    return equipements_list, True
 
 
 # ==========================================
