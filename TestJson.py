@@ -255,8 +255,6 @@ EXCLUDE_KEYS = {
     "validate_conditions", "chaudiere_plus_que_deux_ans",
     "radiateurs_plus_que_deux_ans", "is_multiple_entry_auto_filled",
     "mise_en_place_pare_vapeur", "date_debut_travaux",
-    # Clés internes de calcul BAR-EN-101 (non affichées)
-    "resistance_thermique_non_exported",  # remplacée par resistance_thermique dans BAR-EN-105
 }
 
 # ==========================================
@@ -274,14 +272,19 @@ EXCLUDE_KEYS_WITHOUT_TYPE_POSE = EXCLUDE_KEYS - {"type_pose"}
 #              (champs présents dans le formData mais non pertinents pour cette fiche)
 EXCLUDE_KEYS_BAR_EN_102 = EXCLUDE_KEYS | {"type_logement", "energie_chauffage"}
 
+# BAR-EN-105 : resistance_thermique_non_exported doit passer (remappée vers resistance_thermique)
+#              → on l'ajoute à toutes les autres fiches via le set global étendu
+EXCLUDE_KEYS_DEFAULT = EXCLUDE_KEYS
+
 
 def get_exclude_set(ref_upper):
     """Retourne le set d'exclusion adapté à la fiche détectée."""
     if "BAR-EN-101" in ref_upper:
-        return EXCLUDE_KEYS_WITHOUT_TYPE_POSE
+        # type_pose réintégré pour mapping, resistance_thermique_non_exported exclue
+        return EXCLUDE_KEYS_WITHOUT_TYPE_POSE | {"resistance_thermique_non_exported"}
     if "BAR-EN-102" in ref_upper:
         return EXCLUDE_KEYS_BAR_EN_102
-    return EXCLUDE_KEYS
+    return EXCLUDE_KEYS_DEFAULT
 
 
 if uploaded_file is not None:
