@@ -255,6 +255,7 @@ EXCLUDE_KEYS = {
     "validate_conditions", "chaudiere_plus_que_deux_ans",
     "radiateurs_plus_que_deux_ans", "is_multiple_entry_auto_filled",
     "mise_en_place_pare_vapeur", "date_debut_travaux",
+    "version_coup_de_pouce", "energie_chauffage",
 }
 
 # ==========================================
