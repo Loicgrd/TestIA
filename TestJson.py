@@ -30,7 +30,7 @@ import unicodedata
 from datetime import datetime
 import pytz
 
-from core.utils_supervision import REGLES, decoder_valeur, seuil_r_en101, champs_en104
+from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104
 
 st.set_page_config(page_title="Comparateur Odicee / Prestataire", layout="wide")
 
