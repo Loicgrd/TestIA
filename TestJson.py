@@ -31,7 +31,22 @@ from datetime import datetime
 import pytz
 
 import io
+import zipfile
 import pandas as pd
+
+import fitz  # PyMuPDF
+from PIL import Image
+
+try:
+    import pytesseract
+    pytesseract.get_tesseract_version()
+    OCR_DISPONIBLE = True
+except ImportError:
+    OCR_DISPONIBLE = False
+except Exception:
+    # pytesseract présent mais binaire système absent (ex: packages.txt manquant sur
+    # Streamlit Cloud) — on désactive l'OCR plutôt que de planter l'app.
+    OCR_DISPONIBLE = False
 
 from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104
 
@@ -386,6 +401,259 @@ def get_presta_doc(report, doc_type):
 
 
 # ─────────────────────────────────────────────
+# SURLIGNAGE PDF (repris de 5_Surlignage_PDF.py)
+# ─────────────────────────────────────────────
+
+COULEUR_PRESTA = (1, 0.85, 0)       # jaune — trouvée uniquement côté prestataire
+COULEUR_ODICEE_PDF = (0.9, 0.2, 0.2)  # rouge — trouvée uniquement côté Odicee
+COULEUR_ACCORD = (0.2, 0.75, 0.3)   # vert  — trouvée aux deux endroits (même position)
+
+CHAMPS_IGNORES_PDF = {"confidences", "rgeQualifications", "hasOwnerSignature", "hasOwnerStamp",
+                       "ownerSignatureVision"}
+
+DOC_TYPES_EXCLUS_SURLIGNAGE = {"HonorAttestation"}  # jamais surlignée : déclaration signée, pas une pièce probante
+
+
+def valeurs_presta_document(doc_presta):
+    """Aplatit extractedFields (+ technicalFields) d'un document prestataire en (label, valeur)
+    exploitable pour la recherche, en écartant listes/dicts/booléens et valeurs trop courtes."""
+    ef = doc_presta.get("extractedFields") or {}
+    valeurs = []
+    for cle, val in ef.items():
+        if cle in CHAMPS_IGNORES_PDF:
+            continue
+        if cle == "technicalFields" and isinstance(val, dict):
+            for cle2, val2 in val.items():
+                if val2 not in (None, "") and not isinstance(val2, (dict, list, bool)):
+                    valeurs.append((cle2, val2))
+            continue
+        if val not in (None, "") and not isinstance(val, (dict, list, bool)):
+            valeurs.append((cle, val))
+    return [(l, v) for l, v in valeurs if len(str(v).strip()) >= 3]
+
+
+def valeurs_odicee_dossier_pdf(fd, lot):
+    """Valeurs Odicee repérables sur un PDF : champs techniques du lot (formData) + identité
+    du professionnel. Pas de notion de document associé côté Odicee — cherché sur tous les PDF."""
+    valeurs = []
+    EXCLUS = {
+        "reference", "version", "sme", "titre", "count_html_block_A", "validate_requireds",
+        "is_age_batiment_plus_que_deux_ans_auto_filled", "is_multiple_entry",
+        "professionnel_titulaire_signe_qualite", "coefficient_zone_a",
+    }
+    for cle, val in fd.items():
+        if cle in EXCLUS:
+            continue
+        if val not in (None, "") and not isinstance(val, (dict, list, bool)):
+            valeurs.append((cle, val))
+    prof = lot.get("professionnel") or {}
+    if prof.get("siret"):
+        valeurs.append(("SIRET professionnel", prof["siret"]))
+    if prof.get("raisonSociale"):
+        valeurs.append(("Raison sociale professionnel", prof["raisonSociale"]))
+    return [(l, v) for l, v in valeurs if len(str(v).strip()) >= 3]
+
+
+def tokenize_pdf(s):
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return re.findall(r"[a-z0-9]+", s)
+
+
+def chaines_recherche_texte(valeur):
+    """Chaînes littérales pour page.search_for() : la valeur telle quelle + ses formats de
+    date usuels."""
+    chaines = [str(valeur).strip()]
+    s = str(valeur).strip()
+    for fmt_in in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            d = datetime.strptime(s, fmt_in).date()
+            chaines.append(d.strftime("%d/%m/%Y"))
+            chaines.append(d.strftime("%d-%m-%Y"))
+            break
+        except ValueError:
+            continue
+    vues, uniques = set(), []
+    for c in chaines:
+        if c and c not in vues:
+            vues.add(c)
+            uniques.append(c)
+    return uniques
+
+
+def variantes_valeur_pdf(valeur):
+    """Variantes de tokens pour l'OCR : la valeur telle quelle + représentations JJ/MM/AAAA."""
+    variantes = [tokenize_pdf(valeur)]
+    s = str(valeur).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            d = datetime.strptime(s, fmt).date()
+            variantes.append([str(d.day), str(d.month), str(d.year)])
+            variantes.append([f"{d.day:02d}", f"{d.month:02d}", str(d.year)])
+        except ValueError:
+            pass
+    vues, uniques = set(), []
+    for v in variantes:
+        t = tuple(v)
+        if t and t not in vues:
+            vues.add(t)
+            uniques.append(v)
+    return uniques
+
+
+@st.cache_data(show_spinner=False)
+def ocr_page_words(pdf_bytes, page_index, zoom=3, lang="fra"):
+    """OCR une page (mis en cache par PDF + index de page)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[page_index]
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    try:
+        data = pytesseract.image_to_data(img, lang=lang, output_type=pytesseract.Output.DICT)
+    except pytesseract.TesseractError:
+        data = pytesseract.image_to_data(img, lang="eng", output_type=pytesseract.Output.DICT)
+    except pytesseract.pytesseract.TesseractNotFoundError:
+        return []
+    mots = []
+    for i in range(len(data["text"])):
+        txt = data["text"][i].strip()
+        if not txt:
+            continue
+        r = fitz.Rect(
+            data["left"][i], data["top"][i],
+            data["left"][i] + data["width"][i], data["top"][i] + data["height"][i],
+        ) * (1 / zoom)
+        mots.append({"text": txt, "rect": [r.x0, r.y0, r.x1, r.y1]})
+    return mots
+
+
+def trouver_bbox_ocr(mots, valeur):
+    """Cherche une valeur dans les mots OCR (séquence de tokens contigus, ou correspondance
+    de préfixe pour les identifiants longs mal lus comme un SIRET)."""
+    flat = []
+    for wi, w in enumerate(mots):
+        for tok in tokenize_pdf(w["text"]):
+            flat.append((tok, wi))
+    toks_only = [t for t, _ in flat]
+
+    for cand in variantes_valeur_pdf(valeur):
+        n = len(cand)
+        if n == 0:
+            continue
+        for start in range(len(toks_only) - n + 1):
+            if toks_only[start:start + n] == cand:
+                widx = {flat[start + k][1] for k in range(n)}
+                rects = [fitz.Rect(mots[i]["rect"]) for i in widx]
+                r0 = rects[0]
+                for r in rects[1:]:
+                    r0 |= r
+                return r0
+
+    val_tokens = tokenize_pdf(valeur)
+    if len(val_tokens) == 1 and len(val_tokens[0]) >= 6:
+        v = val_tokens[0]
+        for tok, wi in flat:
+            if len(tok) >= 6 and tok[:6] == v[:6]:
+                return fitz.Rect(mots[wi]["rect"])
+    return None
+
+
+def _rects_pour_valeur(page, pdf_bytes, valeur, ocr_active):
+    a_texte = len(page.get_text().strip()) > 20
+    if a_texte:
+        for chaine in chaines_recherche_texte(valeur):
+            rects = page.search_for(chaine)
+            if rects:
+                return rects
+        return []
+    elif ocr_active and OCR_DISPONIBLE:
+        mots = ocr_page_words(pdf_bytes, page.number)
+        bbox = trouver_bbox_ocr(mots, valeur)
+        return [bbox] if bbox else []
+    return []
+
+
+def _se_chevauchent(r1, r2, marge=3):
+    r1e = fitz.Rect(r1.x0 - marge, r1.y0 - marge, r1.x1 + marge, r1.y1 + marge)
+    return r1e.intersects(r2)
+
+
+def surligner_pdf(pdf_bytes, valeurs_presta, valeurs_odicee, ocr_active=True):
+    """PDF (bytes) surligné, coloré selon la ou les source(s) qui confirment une valeur au
+    même endroit : 🟩 vert = Odicee + prestataire, 🟥 rouge = Odicee seul, 🟨 jaune = prestataire
+    seul. valeurs_presta / valeurs_odicee : listes de (label, valeur)."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    trouvees, non_trouvees = [], []
+    valeurs_od_restantes = set(range(len(valeurs_odicee)))
+    valeurs_pr_restantes = set(range(len(valeurs_presta)))
+
+    for page in doc:
+        od_hits = [
+            (i, valeurs_odicee[i], r)
+            for i in range(len(valeurs_odicee))
+            for r in _rects_pour_valeur(page, pdf_bytes, valeurs_odicee[i][1], ocr_active)
+        ]
+        pr_hits = [
+            (i, valeurs_presta[i], r)
+            for i in range(len(valeurs_presta))
+            for r in _rects_pour_valeur(page, pdf_bytes, valeurs_presta[i][1], ocr_active)
+        ]
+
+        pr_utilises = set()
+        for idx_od, (label_od, val_od), r_od in od_hits:
+            valeurs_od_restantes.discard(idx_od)
+            correspond = None
+            for j, (idx_pr, (label_pr, val_pr), r_pr) in enumerate(pr_hits):
+                if j in pr_utilises:
+                    continue
+                if _se_chevauchent(r_od, r_pr):
+                    correspond = j
+                    break
+            if correspond is not None:
+                pr_utilises.add(correspond)
+                valeurs_pr_restantes.discard(pr_hits[correspond][0])
+                couleur = COULEUR_ACCORD
+            else:
+                couleur = COULEUR_ODICEE_PDF
+            annot = page.add_highlight_annot(r_od)
+            annot.set_colors(stroke=couleur)
+            annot.set_opacity(0.4)
+            annot.update()
+
+        for j, (idx_pr, (label_pr, val_pr), r_pr) in enumerate(pr_hits):
+            if j in pr_utilises:
+                continue
+            valeurs_pr_restantes.discard(idx_pr)
+            annot = page.add_highlight_annot(r_pr)
+            annot.set_colors(stroke=COULEUR_PRESTA)
+            annot.set_opacity(0.4)
+            annot.update()
+
+    for i, (label, valeur) in enumerate(valeurs_odicee):
+        (non_trouvees if i in valeurs_od_restantes else trouvees).append((label, valeur))
+    for i, (label, valeur) in enumerate(valeurs_presta):
+        (non_trouvees if i in valeurs_pr_restantes else trouvees).append((label, valeur))
+
+    return doc.write(), trouvees, non_trouvees
+
+
+def trouver_fichier_zip(zip_files, nom_cible):
+    """Retrouve un fichier du ZIP correspondant au fileName du prestataire, en tolérant les
+    écarts d'espaces/casse/tirets entre les deux systèmes."""
+    def normaliser(n):
+        return re.sub(r"[^a-z0-9]", "", n.lower())
+    cible_norm = normaliser(nom_cible)
+    for nom in zip_files:
+        if normaliser(nom) == cible_norm:
+            return nom
+    for nom in zip_files:
+        if normaliser(nom.rsplit(".", 1)[0]) in cible_norm or cible_norm in normaliser(nom):
+            return nom
+    return None
+
+
+# ─────────────────────────────────────────────
 # UI
 # ─────────────────────────────────────────────
 
@@ -443,6 +711,7 @@ except Exception as e:
     st.stop()
 
 report = presta.get("report") or {}
+documents_presta = report.get("documents", []) or []
 fiche_presta = str(report.get("barReference", "")).upper()
 filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
 
@@ -685,6 +954,136 @@ with st.expander("📜 Règles de conformité du prestataire (pour information)"
             st.markdown(f"{icone} **{r.get('ruleId')}** — {r.get('message')}")
     else:
         st.caption("Aucune non-conformité signalée par le prestataire.")
+
+
+# ─────────────────────────────────────────────
+# SURLIGNAGE PDF (optionnel — même analyse que ci-dessus, appliquée aux PDF du dossier)
+# ─────────────────────────────────────────────
+
+st.markdown("---")
+st.markdown("## 🖍️ Surlignage PDF (optionnel)")
+st.caption(
+    "Déposez le ZIP des pièces jointes de ce dossier pour surligner, directement sur les PDF, "
+    "les valeurs Odicee et prestataire déjà comparées ci-dessus — "
+    "🟩 trouvée aux deux endroits · 🟥 Odicee seul · 🟨 prestataire seul."
+)
+
+fichier_zip_surlignage = st.file_uploader("ZIP des PDF du dossier", type="zip", key="zip_surlignage")
+
+if fichier_zip_surlignage:
+    if not OCR_DISPONIBLE:
+        st.warning(
+            "⚠️ Tesseract OCR n'est pas disponible sur ce serveur — seuls les PDF avec calque "
+            "texte pourront être surlignés (les PDF scannés seront ignorés).\n\n"
+            "**Sur Streamlit Community Cloud** : ajoutez un fichier `packages.txt` à la racine "
+            "du repo contenant `tesseract-ocr` et `tesseract-ocr-fra`, puis redémarrez l'app "
+            "(Manage app → Reboot).\n\n"
+            "**Sur un serveur classique** : `apt install tesseract-ocr tesseract-ocr-fra`."
+        )
+
+    try:
+        zf = zipfile.ZipFile(fichier_zip_surlignage)
+        pdfs_zip = {n: zf.read(n) for n in zf.namelist() if n.lower().endswith(".pdf")}
+    except Exception as e:
+        st.error(f"ZIP invalide : {e}")
+        pdfs_zip = None
+
+    if pdfs_zip is not None:
+        documents_surlignables = [
+            d for d in documents_presta if d.get("type") not in DOC_TYPES_EXCLUS_SURLIGNAGE
+        ]
+        if not documents_surlignables:
+            st.warning("Aucun document surlignable dans ce rapport (l'attestation sur l'honneur est exclue).")
+        else:
+            valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot)
+
+            noms_docs_pdf = [d.get("fileName") for d in documents_surlignables if d.get("fileName")]
+            doc_choisi_nom_pdf = st.selectbox("Document à surligner :", noms_docs_pdf, key="doc_surlignage")
+            doc_choisi_pdf = next(d for d in documents_surlignables if d.get("fileName") == doc_choisi_nom_pdf)
+
+            nom_fichier_zip_pdf = trouver_fichier_zip(pdfs_zip, doc_choisi_nom_pdf)
+            if not nom_fichier_zip_pdf:
+                st.error(
+                    f"Le fichier **{doc_choisi_nom_pdf}** annoncé par le prestataire est introuvable "
+                    f"dans le ZIP. Fichiers disponibles : {', '.join(pdfs_zip) or '—'}"
+                )
+            else:
+                valeurs_presta_pdf = valeurs_presta_document(doc_choisi_pdf)
+
+                with st.expander(f"🟨 {len(valeurs_presta_pdf)} valeur(s) prestataire recherchée(s) sur ce document"):
+                    st.write({l: v for l, v in valeurs_presta_pdf})
+                with st.expander(f"🟥 {len(valeurs_odicee_pdf)} valeur(s) Odicee recherchée(s) (tous documents)"):
+                    st.write({l: v for l, v in valeurs_odicee_pdf})
+
+                pdf_bytes_sel = pdfs_zip[nom_fichier_zip_pdf]
+                nb_pages_sel = fitz.open(stream=pdf_bytes_sel, filetype="pdf").page_count
+                a_calque_texte_sel = any(
+                    len(fitz.open(stream=pdf_bytes_sel, filetype="pdf")[i].get_text().strip()) > 20
+                    for i in range(nb_pages_sel)
+                )
+                if not a_calque_texte_sel:
+                    st.caption(
+                        f"📄 Document scanné ({nb_pages_sel} page(s)) — traitement par OCR, "
+                        "peut prendre quelques secondes."
+                    )
+
+                with st.spinner("Surlignage en cours..."):
+                    pdf_annote_sel, trouvees_sel, non_trouvees_sel = surligner_pdf(
+                        pdf_bytes_sel, valeurs_presta_pdf, valeurs_odicee_pdf
+                    )
+
+                cc1, cc2 = st.columns(2)
+                cc1.metric("Valeurs localisées", len(trouvees_sel))
+                cc2.metric("Valeurs non localisées", len(non_trouvees_sel))
+                if non_trouvees_sel:
+                    with st.expander("⚪ Valeurs non localisées sur ce document"):
+                        for l, v in non_trouvees_sel:
+                            st.caption(f"{l} : {v}")
+
+                st.download_button(
+                    "📥 Télécharger ce PDF surligné",
+                    data=pdf_annote_sel,
+                    file_name=f"surligne_{doc_choisi_nom_pdf}",
+                    mime="application/pdf",
+                )
+
+                st.markdown("---")
+                doc_rendu_sel = fitz.open(stream=pdf_annote_sel, filetype="pdf")
+                for i in range(doc_rendu_sel.page_count):
+                    pix_sel = doc_rendu_sel[i].get_pixmap(matrix=fitz.Matrix(1.8, 1.8))
+                    st.image(
+                        pix_sel.tobytes("png"),
+                        caption=f"Page {i + 1}/{doc_rendu_sel.page_count}",
+                        use_container_width=True,
+                    )
+
+            st.markdown("---")
+            st.caption(
+                "Génère un ZIP avec chaque document du dossier surligné (hors attestation sur "
+                "l'honneur). Peut prendre du temps si plusieurs PDF sont scannés."
+            )
+            if st.button("Générer le ZIP de tous les documents surlignés"):
+                zip_buffer_sel = io.BytesIO()
+                with st.spinner("Surlignage de tous les documents en cours..."):
+                    with zipfile.ZipFile(zip_buffer_sel, "w", zipfile.ZIP_DEFLATED) as zout:
+                        barre_sel = st.progress(0.0)
+                        for i, doc_p in enumerate(documents_surlignables):
+                            nom_p = doc_p.get("fileName")
+                            nom_zip_p = trouver_fichier_zip(pdfs_zip, nom_p)
+                            if not nom_zip_p:
+                                st.caption(f"⚠️ {nom_p} introuvable dans le ZIP — ignoré.")
+                                continue
+                            pdf_bytes_p = pdfs_zip[nom_zip_p]
+                            valeurs_presta_p = valeurs_presta_document(doc_p)
+                            pdf_annote_p, _, _ = surligner_pdf(pdf_bytes_p, valeurs_presta_p, valeurs_odicee_pdf)
+                            zout.writestr(f"surligne_{nom_p}", pdf_annote_p)
+                            barre_sel.progress((i + 1) / len(documents_surlignables))
+                st.download_button(
+                    "📥 Télécharger le ZIP",
+                    data=zip_buffer_sel.getvalue(),
+                    file_name=f"surlignage_{id_odicee}.zip",
+                    mime="application/zip",
+                )
 
 
 # ─────────────────────────────────────────────
