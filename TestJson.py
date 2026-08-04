@@ -30,6 +30,9 @@ import unicodedata
 from datetime import datetime
 import pytz
 
+import io
+import pandas as pd
+
 from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104
 
 st.set_page_config(page_title="Comparateur Odicee / Prestataire", layout="wide")
@@ -375,6 +378,21 @@ st.caption(
     "confronter les valeurs extraites champ par champ."
 )
 
+st.sidebar.header("🔗 Raccourci API")
+num_dossier_sidebar = st.sidebar.text_input("Numéro de dossier (ex: T239148)")
+if num_dossier_sidebar:
+    num_clean = re.sub(r"\D", "", num_dossier_sidebar)
+    if num_clean:
+        st.sidebar.markdown(
+            f'<a href="https://odicee.edf.fr/api/dossiers/{num_clean}" target="_blank">➡️ JSON Odicee {num_clean}</a>',
+            unsafe_allow_html=True,
+        )
+        st.sidebar.markdown(
+            f'<a href="https://docminddev.promotelec-services.com/api/dossiers/{num_clean}" target="_blank">➡️ JSON Prestataire {num_clean}</a>',
+            unsafe_allow_html=True,
+        )
+        st.sidebar.caption("Ctrl+S sur la page pour sauvegarder, puis importez ci-dessous.")
+
 col_up1, col_up2 = st.columns(2)
 with col_up1:
     fichier_odicee = st.file_uploader("JSON Odicee (dossier)", type="json", key="odicee")
@@ -413,6 +431,16 @@ c1.metric("N° dossier Odicee", id_odicee)
 c2.metric("N° dossier Prestataire", filenumber_presta or "—")
 match_id = dossier_id == id_presta_clean
 c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart — vérifier le rapprochement'}")
+
+if dossier_id:
+    url_odicee = f"https://odicee.edf.fr/api/dossiers/{dossier_id}"
+    url_presta = f"https://docminddev.promotelec-services.com/api/dossiers/{dossier_id}"
+    st.markdown(
+        f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>'
+        f'&nbsp;&nbsp;·&nbsp;&nbsp;'
+        f'<a href="{url_presta}" target="_blank">🔗 Ouvrir le JSON Prestataire (API)</a>',
+        unsafe_allow_html=True,
+    )
 
 if not match_id:
     st.warning(
@@ -491,6 +519,7 @@ st.table(
 st.markdown("#### 🔧 Données techniques")
 
 ref_upper = fiche_odicee_match.upper()
+export_technique = None  # rempli par chaque branche ci-dessous, utilisé pour l'export Excel
 
 if "BAR-TH-106" in ref_upper:
     lignes_th106, note_th106 = comparer_th106(fd, report)
@@ -514,6 +543,7 @@ if "BAR-TH-106" in ref_upper:
         "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté. "
         "Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain)."
     )
+    export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
 
 elif "BAR-TH-158" in ref_upper:
     odicee_rows, presta_rows, total_od, total_pr = comparer_th158(fd, report)
@@ -535,6 +565,14 @@ elif "BAR-TH-158" in ref_upper:
     with col_pr:
         st.markdown("**Prestataire — factures**")
         st.table(presta_rows) if presta_rows else st.caption("Aucune ligne.")
+    export_technique = {
+        "type": "th158",
+        "titre": "Equipements",
+        "odicee_df": pd.DataFrame(odicee_rows),
+        "presta_df": pd.DataFrame(presta_rows),
+        "total_odicee": total_od,
+        "total_presta": total_pr,
+    }
 
 else:
     if "BAR-EN-104" in ref_upper:
@@ -598,20 +636,10 @@ else:
                     "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle (à vérifier "
                     "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés."
                 )
+                export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
             else:
                 st.caption("Aucun champ mappé n'a de correspondance exploitable.")
 
-    # Champs prestataire non mappés, pour visibilité (aide à compléter FIELD_MAPPING)
-    if mapping_fiche and docs_presents:
-        with st.expander("🔍 Champs technicalFields du prestataire non rapprochés"):
-            cles_mappees = set(mapping_fiche.values())
-            for dt in docs_presents:
-                doc = get_presta_doc(report, dt)
-                tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
-                non_mappes = {k: v for k, v in tf.items() if k not in cles_mappees}
-                if non_mappes:
-                    st.markdown(f"**{LABEL_DOC_TYPE[dt]}** ({doc.get('fileName')})")
-                    st.json(non_mappes)
 
 # ── Règles de conformité déjà calculées par le prestataire (pour contexte) ──
 with st.expander("📜 Règles de conformité du prestataire (pour information)"):
@@ -623,3 +651,60 @@ with st.expander("📜 Règles de conformité du prestataire (pour information)"
             st.markdown(f"{icone} **{r.get('ruleId')}** — {r.get('message')}")
     else:
         st.caption("Aucune non-conformité signalée par le prestataire.")
+
+
+# ─────────────────────────────────────────────
+# EXPORT DU RAPPORT (Excel)
+# ─────────────────────────────────────────────
+
+def construire_rapport_excel():
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df_identite = pd.DataFrame(
+            {
+                "Champ": ["N° dossier Odicee", "N° dossier Prestataire", "Fiche", "Site"]
+                + [l[1] for l in lignes_html],
+                "Odicee": [id_odicee, "", fiche_odicee_match, adresse_site]
+                + [l[2] for l in lignes_html],
+                "Prestataire": ["", filenumber_presta, fiche_presta, ""]
+                + [l[3] for l in lignes_html],
+                "Détail écart": ["", "", "", ""] + [l[4] for l in lignes_html],
+            }
+        )
+        df_identite.to_excel(writer, sheet_name="Identification", index=False)
+
+        if export_technique:
+            if export_technique["type"] == "table":
+                export_technique["df"].to_excel(writer, sheet_name="Données techniques", index=False)
+            elif export_technique["type"] == "th158":
+                export_technique["odicee_df"].to_excel(
+                    writer, sheet_name="Equipements Odicee", index=False
+                )
+                export_technique["presta_df"].to_excel(
+                    writer, sheet_name="Equipements Presta", index=False
+                )
+                pd.DataFrame(
+                    {
+                        "Total": ["Odicee", "Prestataire"],
+                        "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
+                    }
+                ).to_excel(writer, sheet_name="Equipements - total", index=False)
+
+        df_regles = pd.DataFrame(
+            [
+                {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message")}
+                for r in non_conformes
+            ]
+        ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message"])
+        df_regles.to_excel(writer, sheet_name="Non-conformités prestataire", index=False)
+
+    return buffer.getvalue()
+
+
+st.markdown("---")
+st.download_button(
+    "📥 Télécharger le rapport (Excel)",
+    data=construire_rapport_excel(),
+    file_name=f"comparaison_{id_odicee}_{fiche_odicee_match}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
