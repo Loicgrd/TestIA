@@ -1,433 +1,625 @@
+"""
+Comparateur Odicee <-> Prestataire IA
+======================================
+
+Objectif : le prestataire IA génère un JSON d'analyse par dossier (extraction des
+documents + vérification de règles), mais peine à comparer correctement ses valeurs
+extraites avec le JSON Odicee de référence. Cette app fait ce rapprochement
+champ par champ, en réutilisant le référentiel de champs de la supervision manuelle
+(core/utils_supervision.py) plutôt que de le redéfinir.
+
+Entrées :
+  1. Le JSON Odicee du dossier (export brut, celui utilisé par 3_Supervision_Dossier.py)
+  2. Le JSON produit par le prestataire (report.documents[].extractedFields...)
+
+Sortie : un tableau champ par champ (valeur Odicee vs valeur(s) extraite(s) par
+document prestataire), avec les écarts mis en évidence, + les vérifications
+d'identité du dossier (n° dossier, fiche, adresse, dates, SIRET).
+
+NOTE : la table FIELD_MAPPING ci-dessous n'est construite avec certitude que pour
+BAR-EN-101 (seul exemple de JSON prestataire vu à ce jour). Les autres fiches sont
+pré-remplies par analogie de nom de champ (cf. REGLES dans utils_supervision.py) mais
+à valider dès qu'un JSON prestataire réel pour ces fiches sera disponible — elles sont
+signalées comme telles dans l'UI.
+"""
+
 import streamlit as st
 import json
-import pandas as pd
-from datetime import datetime
-import io
 import re
+import unicodedata
+from datetime import datetime
 import pytz
 
-st.set_page_config(page_title="Extracteur JSON - Fiches BAR (CEE)", layout="wide")
+from core.utils_supervision import REGLES, decoder_valeur, seuil_r_en101, champs_en104
 
-# ==========================================
-# BARRE LATÉRALE : RACCOURCI DE TÉLÉCHARGEMENT
-# ==========================================
-st.sidebar.header("🔗 Raccourci Odicee")
-st.sidebar.write("Générez rapidement le lien d'un dossier pour extraire son JSON :")
-num_dossier = st.sidebar.text_input("Numéro de dossier (ex: T123272, CP123456...)")
+st.set_page_config(page_title="Comparateur Odicee / Prestataire", layout="wide")
 
-if num_dossier:
-    num_dossier_clean = re.sub(r'\D', '', num_dossier)
-    if num_dossier_clean:
-        lien = f"https://odicee.edf.fr/api/dossiers/{num_dossier_clean}"
-        st.sidebar.markdown(f"**[➡️ Ouvrir le JSON du dossier {num_dossier_clean}]({lien})**")
-        st.sidebar.caption("Astuce : Sur la nouvelle page, faites *Ctrl + S* pour sauvegarder le fichier, puis importez-le au centre de cette page.")
-
-# ==========================================
-# CORPS DE L'APPLICATION
-# ==========================================
-st.title("📄 Extracteur de données JSON - Dossiers CEE")
-st.write("Importez votre fichier JSON pour extraire automatiquement les valeurs des fiches BAR par type d'opération.")
-
-uploaded_file = st.file_uploader("Choisissez un fichier JSON", type="json")
-
-def format_timestamp(ts):
-    if ts:
-        paris_tz = pytz.timezone('Europe/Paris')
-        dt = datetime.fromtimestamp(ts / 1000.0, paris_tz)
-        return dt.strftime('%d/%m/%Y')
-    return None
-
-# ==========================================
-# MAPPINGS PAR FICHE
-# ==========================================
-
-SEUIL_BAR_EN_104_V2 = datetime(2024, 1, 1, tzinfo=pytz.timezone('Europe/Paris'))
-
-def apply_mappings(fiche_ref, tech_chars, date_eng_ts=None):
-    """Applique les mappings de valeurs selon la fiche concernée.
-    
-    date_eng_ts : timestamp brut (ms) de dateEngagementReelle, utilisé pour
-                  les mappings dont la signification dépend de la version du formulaire.
-    """
-    ref_upper = str(fiche_ref).upper()
-
-    # BAR-EN-101 : type_pose
-    if "BAR-EN-101" in ref_upper:
-        if "type_pose" in tech_chars:
-            val = tech_chars["type_pose"]
-            tech_chars["type_pose"] = "En combles perdus" if val == 0 else "En rampant de toiture" if val == 1 else val
-
-    # BAR-EN-104 : type_fenetre
-    # Avant 01/01/2024 : 0=Fenêtre de toiture, 1=Autre(s) fenêtre(s)
-    # À partir du 01/01/2024 : 0=Fenêtre de toiture, 1=Double(s) fenêtre(s), 2=Autre(s) fenêtre(s)
-    if "BAR-EN-104" in ref_upper:
-        if "type_fenetre" in tech_chars:
-            val = tech_chars["type_fenetre"]
-            paris_tz = pytz.timezone('Europe/Paris')
-            eng_dt = datetime.fromtimestamp(date_eng_ts / 1000.0, paris_tz) if date_eng_ts else None
-            nouvelle_version = eng_dt is not None and eng_dt >= SEUIL_BAR_EN_104_V2
-
-            if val == 0:
-                tech_chars["type_fenetre"] = "Fenêtre de toiture"
-            elif val == 1:
-                tech_chars["type_fenetre"] = "Double(s) fenêtre(s)" if nouvelle_version else "Autre(s) fenêtre(s)"
-            elif val == 2:
-                # Valeur 2 n'existe qu'en nouvelle version
-                tech_chars["type_fenetre"] = "Autre(s) fenêtre(s)"
-
-        # Marque : marque_fenetre OU marque_isolant
-        if "marque_fenetre" in tech_chars:
-            tech_chars["marque"] = tech_chars.pop("marque_fenetre")
-        elif "marque_isolant" in tech_chars:
-            tech_chars["marque"] = tech_chars.pop("marque_isolant")
-
-        # Référence : reference_fenetre OU reference_isolant
-        if "reference_fenetre" in tech_chars:
-            tech_chars["reference_produit"] = tech_chars.pop("reference_fenetre")
-        elif "reference_isolant" in tech_chars:
-            tech_chars["reference_produit"] = tech_chars.pop("reference_isolant")
-
-        # Renommages explicites pour clarté
-        if "facteur_solaire_sw" in tech_chars:
-            tech_chars["Sw"] = tech_chars.pop("facteur_solaire_sw")
-        if "coefficient_surfacique" in tech_chars:
-            tech_chars["Uw (W/m².K)"] = tech_chars.pop("coefficient_surfacique")
-        if "nombre_de_fenetres_ou_portefenetres" in tech_chars:
-            tech_chars["Quantité"] = tech_chars.pop("nombre_de_fenetres_ou_portefenetres")
-
-    # BAR-EN-105 : résistance thermique (deux clés possibles)
-    if "BAR-EN-105" in ref_upper:
-        if "resistance_thermique_non_exported" in tech_chars:
-            tech_chars["resistance_thermique"] = tech_chars.pop("resistance_thermique_non_exported")
-
-    # BAR-TH-127 : type_logement, type_caisson, type_ventilation
-    if "BAR-TH-127" in ref_upper:
-        if "type_logement" in tech_chars:
-            val = tech_chars["type_logement"]
-            tech_chars["type_installation"] = "Installation collective" if val == 0 else "Installation individuelle" if val == 1 else val
-            del tech_chars["type_logement"]
-
-        if "type_caisson" in tech_chars:
-            val = tech_chars["type_caisson"]
-            if val == 0:
-                tech_chars["type_caisson"] = "caisson standard"
-            elif val == 1:
-                tech_chars["type_caisson"] = "caisson basse consommation"
-            elif val == 2:
-                tech_chars["type_caisson"] = "caisson basse pression"
-
-        if "type_ventilation" in tech_chars:
-            val = tech_chars["type_ventilation"]
-            tech_chars["type_ventilation"] = "hygro A" if val == 0 else "hygro B" if val == 1 else val
-
-        if "classe_energetique" in tech_chars:
-            val = tech_chars["classe_energetique"]
-            tech_chars["classe_energetique"] = {0: "A+", 1: "A", 2: "B"}.get(val, val)
-
-    return tech_chars
+PARIS_TZ = pytz.timezone("Europe/Paris")
 
 
-def extract_equipements_th158(tech_chars):
-    """BAR-TH-158 : tableau Equipements multi-lignes (marque, ref, qté, puissance)."""
-    tech_chars.pop("type_logement", None)
-    equipements_list = []
-    eq_key = next((k for k in list(tech_chars.keys()) if k.lower() == "equipements"), None)
-    if eq_key:
-        eq_data = tech_chars.pop(eq_key)
-        try:
-            if isinstance(eq_data, dict) and "values" in eq_data:
-                values_data = eq_data["values"]
-                eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
-            elif isinstance(eq_data, str):
-                eq_list = json.loads(eq_data)
-            elif isinstance(eq_data, list):
-                eq_list = eq_data
-            else:
-                eq_list = []
+# ─────────────────────────────────────────────
+# MAPPING CHAMP ODICEE (formData) <-> CHAMP PRESTATAIRE (technicalFields)
+# ─────────────────────────────────────────────
+# Pour chaque fiche : { cle_odicee: cle_prestataire }
+# Construit à partir de REGLES (utils_supervision.py) pour les libellés/unités/criticité,
+# et complété ici avec le nom du champ tel qu'il ressort du JSON prestataire.
 
-            for item in eq_list:
-                equipements_list.append({
-                    "Éq. Marque":        item[0] if len(item) > 0 else "",
-                    "Éq. Référence":     item[1] if len(item) > 1 else "",
-                    "Éq. Quantité":      item[3] if len(item) > 3 else "",
-                    "Éq. Puissance (W)": item[4] if len(item) > 4 else ""
-                })
-        except Exception:
-            pass
-    return equipements_list
-
-
-# Clés à exclure uniquement en mode individuel pour BAR-TH-106
-EXCLUDE_TH106_INDIVIDUEL = {"puissance_thermique_nominale", "nombre_d_appartement", "nb_equipements"}
-
-# Mapping classe_regulateur (menu déroulant Odicee) → classe ErP
-CLASSE_REGULATEUR_MAP = {0: "IV", 1: "V", 2: "VI", 3: "VII", 4: "VIII"}
-
-def extract_equipements_th106(tech_chars):
-    """
-    BAR-TH-106 : deux cas selon type_logement.
-      - Individuel (type_logement == 1) : champs directs dans formData.
-        Les clés puissance_thermique_nominale, nombre_d_appartement, nb_equipements
-        sont supprimées. classe_regulateur est traduit (0→IV … 4→VIII).
-        La clé Puissance (tableau vide) est supprimée.
-      - Collectif  (type_logement == 2) : tableau Puissance.values[i] parsé
-        en lignes d'équipements. La clé Puissance est conservée pour parsing
-        puis supprimée.
-    type_logement est traduit en libellé dans les deux cas.
-    Retourne (equipements_list, est_collectif).
-    """
-    equipements_list = []
-    type_logement = tech_chars.get("type_logement")
-    est_collectif = (type_logement == 2)
-
-    # Traduire type_logement en libellé lisible
-    if "type_logement" in tech_chars:
-        tech_chars["type_logement"] = "Collectif" if est_collectif else "Individuel"
-
-    if not est_collectif:
-        # --- CAS INDIVIDUEL ---
-        # Supprimer les champs non pertinents en individuel
-        for k in EXCLUDE_TH106_INDIVIDUEL:
-            tech_chars.pop(k, None)
-        # Mapper classe_regulateur (menu déroulant → classe ErP)
-        if "classe_regulateur" in tech_chars:
-            val = tech_chars["classe_regulateur"]
-            tech_chars["classe_regulateur"] = CLASSE_REGULATEUR_MAP.get(val, val)
-        # Supprimer la clé Puissance si présente (tableau vide en individuel)
-        puissance_key = next((k for k in list(tech_chars.keys()) if k.lower() == "puissance"), None)
-        if puissance_key:
-            tech_chars.pop(puissance_key)
-        return equipements_list, False
-
-    # --- CAS COLLECTIF ---
-    puissance_key = next((k for k in list(tech_chars.keys()) if k.lower() == "puissance"), None)
-    if puissance_key:
-        eq_data = tech_chars.pop(puissance_key)
-        try:
-            if isinstance(eq_data, dict) and "values" in eq_data:
-                values_data = eq_data["values"]
-                eq_list = json.loads(values_data) if isinstance(values_data, str) else values_data
-            elif isinstance(eq_data, str):
-                eq_list = json.loads(eq_data)
-            elif isinstance(eq_data, list):
-                eq_list = eq_data
-            else:
-                eq_list = []
-
-            for item in eq_list:
-                equipements_list.append({
-                    "Éq. M et R Chaudière":  item[0] if len(item) > 0 else "",
-                    "Éq. Quantité":          item[1] if len(item) > 1 else "",
-                    "Éq. Puissance (kW)":    item[2] if len(item) > 2 else "",
-                    "Éq. ETAS (%)":          item[3] if len(item) > 3 else "",
-                    "Éq. M et R Régulateur": item[4] if len(item) > 4 else "",
-                    "Éq. Classe régu":       item[5] if len(item) > 5 else ""
-                })
-        except Exception:
-            pass
-
-    return equipements_list, True
-
-
-# ==========================================
-# CLÉS À EXCLURE GLOBALEMENT
-# ==========================================
-EXCLUDE_KEYS = {
-    "sme", "titre", "ville", "version", "Altitude", "reference",
-    "code_postal", "departement", "zoneClimatique", "adresse_travaux",
-    "nom_site_travaux", "zoneGeographique", "adresse_travaux_ah",
-    "complement_adresse", "count_html_block_A", "secteurApplication",
-    "nombreLogements", "nombreLogementsConventionnes", "age_batiment_plus_que_deux_ans",
-    "volume", "volumeClassique", "volumePrecarite", "professionnel_titulaire_signe_qualite",
-    "coefficient_zone_a", "energieChauffage",
-    "type_pose",  # géré via mapping BAR-EN-101 uniquement
-    "min_value_resistance", "soustraction_resistance_minvr",
-    "is_age_batiment_plus_que_deux_ans_auto_filled",
-    "delta_temperature", "type_logement_and_chauffage", "systeme_chauffage_central",
-    "ID Professionnel sous traitant", "type_emetteur_electrique",
-    "marque_emetteurs", "reference_emetteurs", "is_multiple_entry",
-    "surface_habitable_35", "surface_habitable_130", "surface_habitable_35_60",
-    "surface_habitable_60_70", "surface_habitable_70_90", "surface_habitable_90_110",
-    "surface_habitable_110_130", "max_puissance_collective",
-    "validate_value_for_type_caisson", "validate_choice_for_type_caisson",
-    "reference_technique", "validate_requireds", "surface_habitable_70",
-    "batiment_age_plus_de_2_ans", "diff_nb_chaudiere_appartements",
-    "validate_conditions", "chaudiere_plus_que_deux_ans",
-    "radiateurs_plus_que_deux_ans", "is_multiple_entry_auto_filled",
-    "mise_en_place_pare_vapeur", "date_debut_travaux",
-    "version_coup_de_pouce", "energie_chauffage",
+FIELD_MAPPING = {
+    # Confirmé sur JSON prestataire réel (mêmes clés technicalFields sur EN-101/102/103/105).
+    "BAR-EN-101": {
+        "surface": "surfaceM2",
+        "resistance_thermique": "thermalResistance",
+        "marque_isolant": "brand",
+        "reference_isolant": "productReference",
+        "epaisseur_isolant": "thicknessMm",
+        "date_visite_pro": "preVisitDate",
+    },
+    "BAR-EN-102": {
+        "surface": "surfaceM2",
+        "resistance_thermique": "thermalResistance",
+        "marque_isolant": "brand",
+        "reference_isolant": "productReference",
+        "epaisseur_isolant": "thicknessMm",
+        "date_visite_pro": "preVisitDate",
+    },
+    "BAR-EN-103": {
+        "surface": "surfaceM2",
+        "resistance_thermique": "thermalResistance",
+        "marque_isolant": "brand",
+        "reference_isolant": "productReference",
+        "epaisseur_isolant": "thicknessMm",
+        "date_visite_pro": "preVisitDate",
+    },
+    "BAR-EN-105": {
+        "surface": "surfaceM2",
+        "resistance_thermique_non_exported": "thermalResistance",
+        "marque_isolant": "brand",
+        "reference_isolant": "productReference",
+        "epaisseur_isolant": "thicknessMm",
+    },
+    # EN-104 : type_fenetre non mappé (pas de correspondance fiable côté prestataire entre
+    # "doubleWindow"/"installLocation" et le codage 0/1/2 Odicee) — à vérifier manuellement.
+    "BAR-EN-104": {
+        "coefficient_surfacique": "uw",
+        "facteur_solaire_sw": "sw",
+        "marque_fenetre": "brand",
+        "reference_fenetre": "productReference",
+        "surface_fenetres": "surfaceM2",
+        "nombre_de_fenetres_ou_portefenetres": "quantity",
+    },
+    # BAR-TH-110 : "hasLowTempMention" (mention basse température) n'a pas d'équivalent
+    # structuré côté Odicee — non comparable automatiquement.
+    "BAR-TH-110": {
+        "marque_radiateurs": "brand",
+        "reference_radiateurs": "productReference",
+        "nb_radiateurs": "quantity",
+        "delta_temperature": "dtNomKelvin",
+    },
+    # BAR-TH-127 : seules les marques/références sont comparées automatiquement — les quantités
+    # et puissances prestataire (caissonsQty, weightedAbsorbedPower...) recoupent des notions
+    # calculées côté Odicee (puissance_individuelle/collective, unités différentes selon le
+    # type d'installation) : à vérifier manuellement pour l'instant.
+    "BAR-TH-127": {
+        "marque_caisson": "caissonsBrand",
+        "reference_caisson": "caissonsReference",
+        "marque_bouches_entree_air": "entreesAirBrand",
+        "reference_bouches_entree_air": "entreesAirReference",
+        "marque_bouches_extraction": "bouchesBrand",
+        "reference_bouches_extraction": "bouchesReference",
+    },
+    # BAR-TH-106 et BAR-TH-158 : structure en tableau (multi-équipements) côté Odicee, gérées
+    # à part par comparer_th106() et comparer_th158() plus bas — volontairement absentes d'ici.
 }
 
-# ==========================================
-# EXCLUSIONS SPÉCIFIQUES PAR FICHE
-# Principe : EXCLUDE_KEYS contient les clés à exclure pour TOUTES les fiches.
-# Quand une clé doit être exclue (ou réintégrée) uniquement pour une fiche précise,
-# on construit un set dérivé ici et on le sélectionne dans la boucle via get_exclude_set().
-# ==========================================
-
-# BAR-EN-101 : type_pose réintégré (exclu globalement car inutile ailleurs,
-#              mais nécessaire ici pour le mapping En combles perdus / Rampant de toiture)
-EXCLUDE_KEYS_WITHOUT_TYPE_POSE = EXCLUDE_KEYS - {"type_pose"}
-
-# BAR-EN-102 : type_logement et energie_chauffage à exclure en plus du set global
-#              (champs présents dans le formData mais non pertinents pour cette fiche)
-EXCLUDE_KEYS_BAR_EN_102 = EXCLUDE_KEYS | {"type_logement", "energie_chauffage"}
-
-# BAR-EN-105 : resistance_thermique_non_exported doit passer (remappée vers resistance_thermique)
-#              → on l'ajoute à toutes les autres fiches via le set global étendu
-EXCLUDE_KEYS_DEFAULT = EXCLUDE_KEYS
+# Classe régulateur : côté Odicee toujours en chiffre romain (colonnes directes décodées via
+# decoder_valeur, ou 6e colonne du tableau "Puissance"), côté prestataire en chiffre arabe.
+ROMAIN_VERS_ARABE = {"IV": "4", "V": "5", "VI": "6", "VII": "7", "VIII": "8"}
 
 
-def get_exclude_set(ref_upper):
-    """Retourne le set d'exclusion adapté à la fiche détectée."""
-    if "BAR-EN-101" in ref_upper:
-        # type_pose réintégré pour mapping, resistance_thermique_non_exported exclue
-        return EXCLUDE_KEYS_WITHOUT_TYPE_POSE | {"resistance_thermique_non_exported"}
-    if "BAR-EN-102" in ref_upper:
-        return EXCLUDE_KEYS_BAR_EN_102
-    return EXCLUDE_KEYS_DEFAULT
-
-
-if uploaded_file is not None:
+def _parse_table_values(champ_table):
+    """Parse un champ Odicee de type tableau multi-lignes (structure {'values': '[[...]]', ...}).
+    Retourne la liste de lignes (chaque ligne = liste de valeurs), ou [] si non exploitable."""
+    if not isinstance(champ_table, dict):
+        return []
+    raw = champ_table.get("values")
+    if not raw:
+        return []
     try:
-        data = json.load(uploaded_file)
+        return json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        return []
 
-        dossier_id = data.get("id", "")
-        if dossier_id:
-            st.success(f"Dossier {dossier_id} chargé avec succès !")
 
-        # 1. Extraction des dates globales
-        date_eng_ts  = data.get("dateEngagementReelle")   # timestamp brut (ms) pour les mappings versionnés
-        date_real_ts = data.get("dateRealisationReelle")
-        date_eng  = format_timestamp(date_eng_ts)
-        date_real = format_timestamp(date_real_ts)
+def comparer_th106(fd, report):
+    """BAR-TH-106 : deux structures Odicee possibles.
+    - type_logement == 1 (individuel) : colonnes directes (marque_chaudiere, etc.)
+    - type_logement == 2 (collectif) : tableau 'Puissance', une ligne par type de chaudière
+      = [marque+référence fusionnées, quantité, puissance kW, ETAS %, marque régulateur, classe régulateur].
+    Retourne (lignes_comparaison, note) où note signale un cas à vérifier à la main (ex.
+    plusieurs lignes dans le tableau, ce que la comparaison automatique ne fait pas)."""
+    lignes_table = _parse_table_values(fd.get("Puissance"))
+    note = None
 
-        st.subheader("🗓️ Dates du dossier")
-        col1, col2 = st.columns(2)
-        col1.metric("Date d'engagement réelle",  date_eng  if date_eng  else "Non renseignée")
-        col2.metric("Date de réalisation réelle", date_real if date_real else "Non renseignée")
-
-        # 2. Parcours des sites et lots
-        records_by_fiche = {}
-
-        for site in data.get("sites", []):
-
-            # Adresse du site en dernier recours (non utilisée si formData contient l'adresse)
-            numero_site = site.get("numero", "")
-            voie_site   = site.get("nomVoie", "")
-            cp_site     = site.get("codePostal", "")
-            ville_site  = site.get("ville", "")
-            parts_site  = [str(x) for x in [numero_site, voie_site, cp_site, ville_site] if x]
-            adresse_globale_site = " ".join(parts_site)
-
-            for lot in site.get("lotsTravaux", []):
-                form_data = lot.get("formData", {})
-                fiche_ref = form_data.get("reference", "")
-
-                if "BAR" not in str(fiche_ref).upper():
-                    continue
-
-                if fiche_ref not in records_by_fiche:
-                    records_by_fiche[fiche_ref] = []
-
-                # ---------------------------------------------------
-                # ADRESSE : formData en priorité (adresse_travaux + ville + code_postal)
-                # ---------------------------------------------------
-                adresse_travaux = form_data.get("adresse_travaux", "").strip()
-                ville_fd        = form_data.get("ville", "").strip()
-                cp_fd           = form_data.get("code_postal", "").strip()
-
-                parts_adresse = [x for x in [adresse_travaux, cp_fd, ville_fd] if x]
-                if parts_adresse:
-                    adresse = " ".join(parts_adresse)
-                elif adresse_globale_site:
-                    adresse = adresse_globale_site
-                else:
-                    adresse = "Non renseignée"
-
-                # ---------------------------------------------------
-                # SÉLECTION DES CLÉS TECHNIQUES
-                # ---------------------------------------------------
-                ref_upper = str(fiche_ref).upper()
-
-                exclude_set = get_exclude_set(ref_upper)
-
-                tech_chars = {
-                    k: v for k, v in form_data.items()
-                    if k not in exclude_set and v is not None
-                }
-
-                # ---------------------------------------------------
-                # EXTRACTION DES TABLEAUX D'ÉQUIPEMENTS
-                # ---------------------------------------------------
-                equipements_list = []
-
-                if "BAR-TH-158" in ref_upper:
-                    equipements_list = extract_equipements_th158(tech_chars)
-
-                elif "BAR-TH-106" in ref_upper:
-                    equipements_list, est_collectif = extract_equipements_th106(tech_chars)
-                    # Pour le cas individuel, type_logement reste dans tech_chars mais on
-                    # supprime la clé brute (remplacée par le mapping ci-dessous)
-
-                # ---------------------------------------------------
-                # MAPPINGS DE VALEURS
-                # ---------------------------------------------------
-                tech_chars = apply_mappings(fiche_ref, tech_chars, date_eng_ts)
-
-                # ---------------------------------------------------
-                # CONSTRUCTION DES LIGNES
-                # ---------------------------------------------------
-                # surface_fenetres placée en dernière colonne (BAR-EN-104)
-                surface_fenetres = tech_chars.pop("surface_fenetres", None)
-
-                base_row = {
-                    "Adresse concernée":  adresse,
-                    "Date d'engagement":  date_eng,
-                    "Date de réalisation": date_real
-                }
-                base_row.update(tech_chars)
-
-                if surface_fenetres is not None:
-                    base_row["surface_fenetres"] = surface_fenetres
-
-                if not equipements_list:
-                    records_by_fiche[fiche_ref].append(base_row)
-                else:
-                    # 1ère ligne : données de base + 1er équipement
-                    first_row = {**base_row, **equipements_list[0]}
-                    records_by_fiche[fiche_ref].append(first_row)
-                    # Lignes suivantes : colonnes de base vides + équipements
-                    for eq in equipements_list[1:]:
-                        empty_row = {k: "" for k in base_row.keys()}
-                        empty_row.update(eq)
-                        records_by_fiche[fiche_ref].append(empty_row)
-
-        # 3. Affichage et Export Excel
-        if records_by_fiche:
-            st.subheader("✅ Opération(s) trouvée(s)")
-
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-
-                for fiche, lignes in records_by_fiche.items():
-                    df = pd.DataFrame(lignes).fillna("")
-
-                    st.markdown(f"### 🏷️ Fiche : {fiche} ({len(lignes)} lignes)")
-                    st.dataframe(df, use_container_width=True)
-
-                    nom_onglet = str(fiche)[:31]
-                    df.to_excel(writer, index=False, sheet_name=nom_onglet)
-
-            nom_export = f'extraction_fiches_bar_{dossier_id}.xlsx' if dossier_id else 'extraction_fiches_bar.xlsx'
-            st.download_button(
-                label=f"📥 Télécharger le fichier Excel structuré par Fiches ({nom_export})",
-                data=output.getvalue(),
-                file_name=nom_export,
-                mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    if lignes_table:
+        if len(lignes_table) > 1:
+            note = (
+                f"⚠️ {len(lignes_table)} lignes dans le tableau Odicee 'Puissance' (plusieurs types "
+                "de chaudières) — seule la 1ère ligne est comparée automatiquement ci-dessous, "
+                "vérifiez les autres manuellement."
             )
-        else:
-            st.warning("Aucune fiche BAR n'a été trouvée dans ce JSON.")
+        r0 = lignes_table[0]
+        odicee_vals = {
+            "boiler": r0[0] if len(r0) > 0 else None,
+            "quantite": r0[1] if len(r0) > 1 else None,
+            "puissance_kw": r0[2] if len(r0) > 2 else None,
+            "etas": r0[3] if len(r0) > 3 else None,
+            "regulateur": r0[4] if len(r0) > 4 else None,
+            "classe": ROMAIN_VERS_ARABE.get(r0[5], r0[5]) if len(r0) > 5 else None,
+        }
+    else:
+        odicee_vals = {
+            "boiler": fd.get("marque_chaudiere"),
+            "quantite": None,
+            "puissance_kw": None,
+            "etas": fd.get("efficacite_energetique"),
+            "regulateur": fd.get("marque_regulateur"),
+            "classe": ROMAIN_VERS_ARABE.get(
+                decoder_valeur("BAR-TH-106", "classe_regulateur", fd.get("classe_regulateur")),
+                fd.get("classe_regulateur"),
+            ),
+        }
 
-    except Exception as e:
-        st.error(f"Erreur lors de la lecture du fichier : {e}")
+    champs = [
+        ("Marque/référence chaudière", "boiler", "boilerBrand"),
+        ("Quantité chaudières", "quantite", "quantity"),
+        ("Puissance nominale (kW)", "puissance_kw", "nominalPowerKw"),
+        ("ETAS (%)", "etas", "etasPercent"),
+        ("Marque régulateur", "regulateur", "regulatorBrand"),
+        ("Classe régulateur", "classe", "regulatorClass"),
+    ]
+
+    lignes = []
+    for label, cle_od, cle_pr in champs:
+        valeur_od = odicee_vals.get(cle_od)
+        valeurs_pr = {}
+        for dt in DOC_TYPES_TECHNIQUES:
+            v, _ = get_presta_technical_value(report, dt, cle_pr)
+            valeurs_pr[dt] = v
+        lignes.append((label, valeur_od, valeurs_pr))
+    return lignes, note
+
+
+def comparer_th158(fd, report):
+    """BAR-TH-158 : tableau Odicee 'Equipements' (marque, référence, n° certif NF, quantité,
+    puissance W) à recouper avec un ou plusieurs documents Invoice côté prestataire (une facture
+    par type d'émetteur, dans cet exemple). Pas de correspondance ligne-à-ligne fiable (ordre non
+    garanti) : on affiche les deux tableaux côte à côte + un contrôle de cohérence sur le total
+    des quantités, à charge de l'utilisateur de rapprocher visuellement les lignes."""
+    lignes_odicee = _parse_table_values(fd.get("Equipements"))
+    odicee_rows = [
+        {
+            "Marque": r[0] if len(r) > 0 else None,
+            "Référence": r[1] if len(r) > 1 else None,
+            "N° certif NF": r[2] if len(r) > 2 else None,
+            "Quantité": r[3] if len(r) > 3 else None,
+            "Puissance (W)": r[4] if len(r) > 4 else None,
+        }
+        for r in lignes_odicee
+    ]
+
+    presta_rows = []
+    for doc in report.get("documents", []) or []:
+        if doc.get("type") != "Invoice":
+            continue
+        tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
+        presta_rows.append({
+            "Document": doc.get("fileName"),
+            "Marque": tf.get("brand"),
+            "Référence": tf.get("productReference"),
+            "Quantité": tf.get("quantity"),
+            "Puissance (W)": tf.get("powerW"),
+        })
+
+    total_od = sum(
+        normalise_nombre(r["Quantité"]) or 0 for r in odicee_rows
+    )
+    total_pr = sum(
+        normalise_nombre(r["Quantité"]) or 0 for r in presta_rows
+    )
+    return odicee_rows, presta_rows, total_od, total_pr
+
+# Types de documents prestataire dont les technicalFields portent des valeurs "techniques"
+# comparables au formData Odicee (on ignore VisaRequest/RgeCertificate qui n'en ont pas).
+DOC_TYPES_TECHNIQUES = ["HonorAttestation", "Invoice"]
+LABEL_DOC_TYPE = {
+    "HonorAttestation": "AH (prestataire)",
+    "Invoice": "Facture (prestataire)",
+    "LetterOfCommand": "Bon de commande (prestataire)",
+    "VisaRequest": "Visa (prestataire)",
+    "RgeCertificate": "RGE (prestataire)",
+}
+
+
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def fmt_ts(ts):
+    if ts:
+        return datetime.fromtimestamp(ts / 1000.0, PARIS_TZ).strftime("%d/%m/%Y")
+    return None
+
+
+def normalise_texte(v):
+    if v is None:
+        return ""
+    s = str(v).strip().lower()
+    s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def normalise_nombre(v):
+    """Convertit en float uniquement si la valeur EST un nombre (avec unité éventuelle en
+    fin de chaîne, ex: '7.65 m².K/W' ou '25 kW'). Ne fait PAS de comparaison numérique sur
+    une référence produit/texte contenant un chiffre au milieu (ex: 'UK04', 'EL 000 UK04')
+    — ces cas doivent rester une comparaison texte pour ne pas produire de faux écarts."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", ".")
+    m = re.match(r"^-?\d+(\.\d+)?\s*[a-zA-Zé%²/°.]*$", s)
+    if not m:
+        return None
+    try:
+        return float(re.match(r"^-?\d+(\.\d+)?", s).group(0))
+    except (ValueError, AttributeError):
+        return None
+
+
+def normalise_date(v):
+    """Tente de parser une date sous plusieurs formats courants (JJ/MM/AAAA, AAAA-MM-JJ...).
+    Retourne un objet date ou None si non reconnu."""
+    if v is None or v == "":
+        return None
+    s = str(v).strip()
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def comparer(valeur_odicee, valeur_presta, tolerance=0.01):
+    """Retourne (statut, detail) où statut ∈ {"ok", "ecart", "indeterminé", "manquant"}."""
+    if valeur_odicee in (None, "") and (valeur_presta in (None, "")):
+        return "manquant", "Absent des deux côtés"
+    if valeur_odicee in (None, "") or valeur_presta in (None, ""):
+        return "manquant", "Absent d'un des deux côtés"
+
+    d_od, d_pr = normalise_date(valeur_odicee), normalise_date(valeur_presta)
+    if d_od is not None and d_pr is not None:
+        return ("ok", None) if d_od == d_pr else ("ecart", f"{d_od} ≠ {d_pr}")
+
+    n_od, n_pr = normalise_nombre(valeur_odicee), normalise_nombre(valeur_presta)
+    if n_od is not None and n_pr is not None:
+        if abs(n_od - n_pr) <= tolerance:
+            return "ok", None
+        return "ecart", f"{n_od} ≠ {n_pr}"
+
+    t_od, t_pr = normalise_texte(valeur_odicee), normalise_texte(valeur_presta)
+    if t_od == t_pr:
+        return "ok", None
+    if t_od in t_pr or t_pr in t_od:
+        return "indetermine", "Correspondance partielle — à vérifier visuellement"
+    return "ecart", f"« {valeur_odicee} » ≠ « {valeur_presta} »"
+
+
+def badge(statut):
+    return {
+        "ok": "🟢",
+        "ecart": "🔴",
+        "indetermine": "🟡",
+        "manquant": "⚪",
+    }.get(statut, "⚪")
+
+
+def get_odicee_lots_bar(data):
+    """Reprend la même extraction que 3_Supervision_Dossier.py : tous les lots BAR
+    de tous les sites, regroupés par référence de fiche."""
+    lots_par_fiche = {}
+    for site in data.get("sites", []) or []:
+        num_site = site.get("numero", "")
+        voie = site.get("nomVoie", "")
+        cp = site.get("codePostal", "")
+        ville = site.get("ville", "")
+        adresse_site = " ".join(filter(None, [str(num_site), voie, cp, ville])) or "Site sans adresse"
+        for lot in site.get("lotsTravaux", []) or []:
+            fd = lot.get("formData", {}) or {}
+            ref = str(fd.get("reference", "")).upper()
+            if "BAR" not in ref:
+                continue
+            lots_par_fiche.setdefault(fd.get("reference", ""), []).append((lot, adresse_site))
+    return lots_par_fiche
+
+
+def get_presta_technical_value(report, doc_type, cle_presta):
+    for doc in report.get("documents", []) or []:
+        if doc.get("type") != doc_type:
+            continue
+        tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
+        if cle_presta in tf:
+            return tf[cle_presta], doc.get("fileName")
+        ef = doc.get("extractedFields") or {}
+        if cle_presta in ef:
+            return ef[cle_presta], doc.get("fileName")
+    return None, None
+
+
+def get_presta_doc(report, doc_type):
+    for doc in report.get("documents", []) or []:
+        if doc.get("type") == doc_type:
+            return doc
+    return None
+
+
+# ─────────────────────────────────────────────
+# UI
+# ─────────────────────────────────────────────
+
+st.title("🔀 Comparateur — Odicee vs Prestataire IA")
+st.caption(
+    "Importez le JSON Odicee du dossier et le JSON produit par le prestataire pour "
+    "confronter les valeurs extraites champ par champ."
+)
+
+col_up1, col_up2 = st.columns(2)
+with col_up1:
+    fichier_odicee = st.file_uploader("JSON Odicee (dossier)", type="json", key="odicee")
+with col_up2:
+    fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
+
+if not (fichier_odicee and fichier_presta):
+    st.info("Chargez les deux fichiers pour lancer la comparaison.")
+    st.stop()
+
+try:
+    data = json.load(fichier_odicee)
+except Exception as e:
+    st.error(f"JSON Odicee invalide : {e}")
+    st.stop()
+
+try:
+    presta = json.load(fichier_presta)
+except Exception as e:
+    st.error(f"JSON Prestataire invalide : {e}")
+    st.stop()
+
+report = presta.get("report") or {}
+fiche_presta = str(report.get("barReference", "")).upper()
+filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
+
+# ── Vérification d'identité dossier ──
+st.markdown("### 🪪 Identification du dossier")
+dossier_id = str(data.get("id", ""))
+prefixe = data.get("prefixe", "") or ""
+id_odicee = f"{prefixe}{dossier_id}"
+id_presta_clean = re.sub(r"^\D+", "", filenumber_presta)
+
+c1, c2, c3 = st.columns(3)
+c1.metric("N° dossier Odicee", id_odicee)
+c2.metric("N° dossier Prestataire", filenumber_presta or "—")
+match_id = dossier_id == id_presta_clean
+c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart — vérifier le rapprochement'}")
+
+if not match_id:
+    st.warning(
+        "⚠️ Le numéro de dossier du rapport prestataire ne correspond pas au JSON Odicee chargé. "
+        "Vérifiez que vous comparez bien le même dossier avant d'interpréter les écarts ci-dessous."
+    )
+
+st.markdown("---")
+
+# ── Sélection du lot Odicee correspondant à la fiche du rapport prestataire ──
+lots_par_fiche = get_odicee_lots_bar(data)
+fiche_odicee_match = next((f for f in lots_par_fiche if f.upper() == fiche_presta), None)
+
+if not fiche_odicee_match:
+    st.error(
+        f"Aucun lot Odicee avec la fiche **{fiche_presta or '—'}** trouvé dans ce dossier. "
+        f"Fiches disponibles côté Odicee : {', '.join(lots_par_fiche) or '—'}."
+    )
+    st.stop()
+
+lots_sites = lots_par_fiche[fiche_odicee_match]
+if len(lots_sites) > 1:
+    adresses = [a for _, a in lots_sites]
+    choix = st.selectbox("Plusieurs sites pour cette fiche — choisir celui à comparer :", adresses)
+    lot, adresse_site = next((l, a) for l, a in lots_sites if a == choix)
+else:
+    lot, adresse_site = lots_sites[0]
+
+fd = lot.get("formData", {}) or {}
+
+st.markdown(f"### 📋 Fiche comparée : **{fiche_odicee_match}** — {adresse_site}")
+
+# ── Comparaison des dates & identité chantier (niveau dossier) ──
+st.markdown("#### 📅 Dates & identité chantier")
+doc_engagement = get_presta_doc(report, "LetterOfCommand") or get_presta_doc(report, "VisaRequest")
+doc_realisation = get_presta_doc(report, "Invoice")
+
+rows_identite = []
+
+date_eng_odicee = fmt_ts(data.get("dateEngagementReelle"))
+date_eng_presta = (doc_engagement or {}).get("extractedFields", {}).get("documentDate") or \
+                   (doc_engagement or {}).get("extractedFields", {}).get("signatureDate")
+rows_identite.append(("Date d'engagement", date_eng_odicee, date_eng_presta))
+
+date_real_odicee = fmt_ts(data.get("dateRealisationReelle"))
+date_real_presta = (doc_realisation or {}).get("extractedFields", {}).get("documentDate")
+rows_identite.append(("Date de réalisation", date_real_odicee, date_real_presta))
+
+adresse_fd = " ".join(filter(None, [
+    fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
+])) or None
+adresse_presta = (doc_realisation or {}).get("extractedFields", {}).get("worksAddress")
+rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
+
+prof = lot.get("professionnel") or {}
+siret_odicee = prof.get("siret")
+siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
+rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
+
+lignes_html = []
+for label, v_od, v_pr in rows_identite:
+    statut, detail = comparer(v_od, v_pr, tolerance=0)
+    lignes_html.append((badge(statut), label, v_od if v_od else "—", v_pr if v_pr else "—", detail or ""))
+
+st.table(
+    {
+        "": [l[0] for l in lignes_html],
+        "Champ": [l[1] for l in lignes_html],
+        "Odicee": [l[2] for l in lignes_html],
+        "Prestataire": [l[3] for l in lignes_html],
+        "Détail écart": [l[4] for l in lignes_html],
+    }
+)
+
+# ── Comparaison technique champ par champ ──
+st.markdown("#### 🔧 Données techniques")
+
+ref_upper = fiche_odicee_match.upper()
+
+if "BAR-TH-106" in ref_upper:
+    lignes_th106, note_th106 = comparer_th106(fd, report)
+    if note_th106:
+        st.info(note_th106)
+    docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc(report, dt)]
+    entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
+    lignes = {c: [] for c in entete}
+    for label, valeur_od, valeurs_pr in lignes_th106:
+        statuts = [comparer(valeur_od, valeurs_pr.get(dt))[0] for dt in docs_presents]
+        ordre_gravite = {"ecart": 0, "indetermine": 1, "manquant": 2, "ok": 3}
+        pire = min(statuts, key=lambda s: ordre_gravite[s]) if statuts else "manquant"
+        lignes[""].append(badge(pire))
+        lignes["Champ"].append(label)
+        lignes["Odicee"].append(valeur_od if valeur_od not in (None, "") else "—")
+        for dt in docs_presents:
+            v = valeurs_pr.get(dt)
+            lignes[LABEL_DOC_TYPE[dt]].append(v if v not in (None, "") else "—")
+    st.table(lignes)
+    st.caption(
+        "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté. "
+        "Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain)."
+    )
+
+elif "BAR-TH-158" in ref_upper:
+    odicee_rows, presta_rows, total_od, total_pr = comparer_th158(fd, report)
+    statut_total, detail_total = comparer(total_od, total_pr, tolerance=0)
+    st.markdown(
+        f"{badge(statut_total)} **Total quantité émetteurs** — Odicee : {total_od:g} · "
+        f"Prestataire (somme des factures) : {total_pr:g}"
+    )
+    if statut_total != "ok":
+        st.caption(detail_total or "")
+    st.caption(
+        "Pas de correspondance ligne-à-ligne automatique (l'ordre des lignes n'est pas garanti) — "
+        "rapprochez visuellement marque/référence/quantité entre les deux tableaux ci-dessous."
+    )
+    col_od, col_pr = st.columns(2)
+    with col_od:
+        st.markdown("**Odicee — tableau Equipements**")
+        st.table(odicee_rows) if odicee_rows else st.caption("Aucune ligne.")
+    with col_pr:
+        st.markdown("**Prestataire — factures**")
+        st.table(presta_rows) if presta_rows else st.caption("Aucune ligne.")
+
+else:
+    if "BAR-EN-104" in ref_upper:
+        regles_fiche = champs_en104(data.get("dateEngagementReelle"))
+    else:
+        regles_fiche = REGLES.get(fiche_odicee_match) or next(
+            (v for k, v in REGLES.items() if k in ref_upper), None
+        )
+
+    mapping_fiche = FIELD_MAPPING.get(fiche_odicee_match) or next(
+        (v for k, v in FIELD_MAPPING.items() if k in ref_upper), None
+    )
+
+    if not mapping_fiche:
+        st.warning(
+            f"Aucun mapping de champs défini pour **{fiche_odicee_match}** vers le format prestataire. "
+            "Ajoutez-le dans FIELD_MAPPING une fois un JSON prestataire réel disponible pour cette fiche."
+        )
+    elif not regles_fiche:
+        st.warning(f"Fiche **{fiche_odicee_match}** absente de REGLES (utils_supervision.py).")
+    else:
+        docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc(report, dt)]
+        if not docs_presents:
+            st.warning("Aucun document AH/Facture exploitable dans le JSON prestataire.")
+        else:
+            entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
+            lignes = {c: [] for c in entete}
+
+            for cle_od, label, unite, critique in regles_fiche:
+                if cle_od not in mapping_fiche:
+                    continue
+                cle_pr = mapping_fiche[cle_od]
+                valeur_od = fd.get(cle_od)
+                valeur_od_dec = decoder_valeur(fiche_odicee_match, cle_od, valeur_od)
+
+                valeurs_pr = {}
+                for dt in docs_presents:
+                    v, _fname = get_presta_technical_value(report, dt, cle_pr)
+                    valeurs_pr[dt] = v
+
+                # Statut global de la ligne = pire statut parmi les documents comparés
+                statuts = []
+                for dt in docs_presents:
+                    statut, _ = comparer(valeur_od, valeurs_pr[dt])
+                    statuts.append(statut)
+                ordre_gravite = {"ecart": 0, "indetermine": 1, "manquant": 2, "ok": 3}
+                pire = min(statuts, key=lambda s: ordre_gravite[s]) if statuts else "manquant"
+
+                lignes[""].append(badge(pire))
+                lignes["Champ"].append(f"{label}" + (f" ({unite})" if unite else ""))
+                lignes["Odicee"].append(
+                    f"{valeur_od_dec}" if valeur_od_dec not in (None, "") else "—"
+                )
+                for dt in docs_presents:
+                    v = valeurs_pr[dt]
+                    lignes[LABEL_DOC_TYPE[dt]].append(v if v not in (None, "") else "—")
+
+            if lignes["Champ"]:
+                st.table(lignes)
+                st.caption(
+                    "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle (à vérifier "
+                    "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés."
+                )
+            else:
+                st.caption("Aucun champ mappé n'a de correspondance exploitable.")
+
+    # Champs prestataire non mappés, pour visibilité (aide à compléter FIELD_MAPPING)
+    if mapping_fiche and docs_presents:
+        with st.expander("🔍 Champs technicalFields du prestataire non rapprochés"):
+            cles_mappees = set(mapping_fiche.values())
+            for dt in docs_presents:
+                doc = get_presta_doc(report, dt)
+                tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
+                non_mappes = {k: v for k, v in tf.items() if k not in cles_mappees}
+                if non_mappes:
+                    st.markdown(f"**{LABEL_DOC_TYPE[dt]}** ({doc.get('fileName')})")
+                    st.json(non_mappes)
+
+# ── Règles de conformité déjà calculées par le prestataire (pour contexte) ──
+with st.expander("📜 Règles de conformité du prestataire (pour information)"):
+    global_rules = report.get("globalRules", []) or []
+    non_conformes = [r for r in global_rules if r.get("status") != "Compliant"]
+    if non_conformes:
+        for r in non_conformes:
+            icone = "🔴" if r.get("status") == "NonCompliant" else "🟡"
+            st.markdown(f"{icone} **{r.get('ruleId')}** — {r.get('message')}")
+    else:
+        st.caption("Aucune non-conformité signalée par le prestataire.")
