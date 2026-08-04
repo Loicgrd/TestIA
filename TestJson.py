@@ -295,6 +295,14 @@ def normalise_date(v):
     return None
 
 
+def fmt_date_any(v):
+    """Réaffiche en JJ/MM/AAAA toute valeur reconnue comme une date (le prestataire renvoie
+    ses dates en AAAA-MM-JJ, format Odicee) ; renvoie la valeur telle quelle si ce n'en est
+    pas une (texte, nombre...), pour rester sans effet sur les autres champs."""
+    d = normalise_date(v)
+    return d.strftime("%d/%m/%Y") if d else v
+
+
 def comparer(valeur_odicee, valeur_presta, tolerance=0.01):
     """Retourne (statut, detail) où statut ∈ {"ok", "ecart", "indeterminé", "manquant"}."""
     if valeur_odicee in (None, "") and (valeur_presta in (None, "")):
@@ -492,11 +500,11 @@ rows_identite = []
 date_eng_odicee = fmt_ts(data.get("dateEngagementReelle"))
 date_eng_presta = (doc_engagement or {}).get("extractedFields", {}).get("documentDate") or \
                    (doc_engagement or {}).get("extractedFields", {}).get("signatureDate")
-rows_identite.append(("Date d'engagement", date_eng_odicee, date_eng_presta))
+rows_identite.append(("Date d'engagement", date_eng_odicee, fmt_date_any(date_eng_presta)))
 
 date_real_odicee = fmt_ts(data.get("dateRealisationReelle"))
 date_real_presta = (doc_realisation or {}).get("extractedFields", {}).get("documentDate")
-rows_identite.append(("Date de réalisation", date_real_odicee, date_real_presta))
+rows_identite.append(("Date de réalisation", date_real_odicee, fmt_date_any(date_real_presta)))
 
 adresse_fd = " ".join(filter(None, [
     fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
@@ -546,7 +554,7 @@ if "BAR-TH-106" in ref_upper:
         lignes["Odicee"].append(valeur_od if valeur_od not in (None, "") else "—")
         for dt in docs_presents:
             v = valeurs_pr.get(dt)
-            lignes[LABEL_DOC_TYPE[dt]].append(v if v not in (None, "") else "—")
+            lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
     st.table(lignes)
     st.caption(
         "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté. "
@@ -637,7 +645,7 @@ else:
                 )
                 for dt in docs_presents:
                     v = valeurs_pr[dt]
-                    lignes[LABEL_DOC_TYPE[dt]].append(v if v not in (None, "") else "—")
+                    lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
 
             if lignes["Champ"]:
                 st.table(lignes)
