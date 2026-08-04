@@ -199,7 +199,7 @@ def comparer_th158(fd, report):
     garanti) : on affiche les deux tableaux côte à côte + un contrôle de cohérence sur le total
     des quantités, à charge de l'utilisateur de rapprocher visuellement les lignes."""
     lignes_odicee = _parse_table_values(fd.get("Equipements"))
-    odicee_rows = [
+    odicee_rows_brut = [
         {
             "Marque": r[0] if len(r) > 0 else None,
             "Référence": r[1] if len(r) > 1 else None,
@@ -210,12 +210,12 @@ def comparer_th158(fd, report):
         for r in lignes_odicee
     ]
 
-    presta_rows = []
+    presta_rows_brut = []
     for doc in report.get("documents", []) or []:
         if doc.get("type") != "Invoice":
             continue
         tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
-        presta_rows.append({
+        presta_rows_brut.append({
             "Document": doc.get("fileName"),
             "Marque": tf.get("brand"),
             "Référence": tf.get("productReference"),
@@ -224,11 +224,20 @@ def comparer_th158(fd, report):
         })
 
     total_od = sum(
-        normalise_nombre(r["Quantité"]) or 0 for r in odicee_rows
+        normalise_nombre(r["Quantité"]) or 0 for r in odicee_rows_brut
     )
     total_pr = sum(
-        normalise_nombre(r["Quantité"]) or 0 for r in presta_rows
+        normalise_nombre(r["Quantité"]) or 0 for r in presta_rows_brut
     )
+
+    # Conversion systématique en texte pour l'affichage : évite les erreurs de sérialisation
+    # de st.table/pyarrow quand une colonne mélange int/str/None entre les lignes (Odicee
+    # renvoie des nombres bruts, le prestataire des chaînes — parfois absentes).
+    def _en_texte(rows):
+        return [{k: ("" if v is None else str(v)) for k, v in row.items()} for row in rows]
+
+    odicee_rows = _en_texte(odicee_rows_brut)
+    presta_rows = _en_texte(presta_rows_brut)
     return odicee_rows, presta_rows, total_od, total_pr
 
 # Types de documents prestataire dont les technicalFields portent des valeurs "techniques"
@@ -578,10 +587,18 @@ elif "BAR-TH-158" in ref_upper:
     col_od, col_pr = st.columns(2)
     with col_od:
         st.markdown("**Odicee — tableau Equipements**")
-        st.table(odicee_rows) if odicee_rows else st.caption("Aucune ligne.")
+        try:
+            st.table(odicee_rows) if odicee_rows else st.caption("Aucune ligne.")
+        except Exception as e:
+            st.error(f"Affichage impossible pour ce tableau ({e}).")
+            st.write(odicee_rows)
     with col_pr:
         st.markdown("**Prestataire — factures**")
-        st.table(presta_rows) if presta_rows else st.caption("Aucune ligne.")
+        try:
+            st.table(presta_rows) if presta_rows else st.caption("Aucune ligne.")
+        except Exception as e:
+            st.error(f"Affichage impossible pour ce tableau ({e}).")
+            st.write(presta_rows)
     export_technique = {
         "type": "th158",
         "titre": "Equipements",
