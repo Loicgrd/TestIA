@@ -1,3 +1,5 @@
 xlsxwriter
 pytz
 openpyxl
+pymupdf
+pytesseract
