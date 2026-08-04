@@ -379,7 +379,7 @@ st.caption(
 )
 
 st.sidebar.header("🔗 Raccourci API")
-num_dossier_sidebar = st.sidebar.text_input("Numéro de dossier (ex: T239148)")
+num_dossier_sidebar = st.sidebar.text_input("Numéro de dossier Odicee (ex: T239148)")
 if num_dossier_sidebar:
     num_clean = re.sub(r"\D", "", num_dossier_sidebar)
     if num_clean:
@@ -387,11 +387,21 @@ if num_dossier_sidebar:
             f'<a href="https://odicee.edf.fr/api/dossiers/{num_clean}" target="_blank">➡️ JSON Odicee {num_clean}</a>',
             unsafe_allow_html=True,
         )
-        st.sidebar.markdown(
-            f'<a href="https://docminddev.promotelec-services.com/api/dossiers/{num_clean}" target="_blank">➡️ JSON Prestataire {num_clean}</a>',
-            unsafe_allow_html=True,
-        )
         st.sidebar.caption("Ctrl+S sur la page pour sauvegarder, puis importez ci-dessous.")
+
+st.sidebar.markdown("---")
+id_presta_sidebar = st.sidebar.text_input(
+    "ID Prestataire (identifiant technique, pas le n° de dossier — ex: ce850dc69bf643b3ba4973f9aaf682d4)"
+)
+if id_presta_sidebar:
+    st.sidebar.markdown(
+        f'<a href="https://docminddev.promotelec-services.com/api/dossiers/{id_presta_sidebar.strip()}" target="_blank">➡️ JSON Prestataire</a>',
+        unsafe_allow_html=True,
+    )
+    st.sidebar.caption(
+        "Cet identifiant n'est pas déductible du n° de dossier — une fois le JSON prestataire "
+        "chargé ci-dessous, le lien correspondant s'affiche automatiquement."
+    )
 
 col_up1, col_up2 = st.columns(2)
 with col_up1:
@@ -434,13 +444,12 @@ c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart —
 
 if dossier_id:
     url_odicee = f"https://odicee.edf.fr/api/dossiers/{dossier_id}"
-    url_presta = f"https://docminddev.promotelec-services.com/api/dossiers/{dossier_id}"
-    st.markdown(
-        f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>'
-        f'&nbsp;&nbsp;·&nbsp;&nbsp;'
-        f'<a href="{url_presta}" target="_blank">🔗 Ouvrir le JSON Prestataire (API)</a>',
-        unsafe_allow_html=True,
-    )
+    liens = [f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>']
+    id_technique_presta = presta.get("id")
+    if id_technique_presta:
+        url_presta = f"https://docminddev.promotelec-services.com/api/dossiers/{id_technique_presta}"
+        liens.append(f'<a href="{url_presta}" target="_blank">🔗 Ouvrir le JSON Prestataire (API)</a>')
+    st.markdown("&nbsp;&nbsp;·&nbsp;&nbsp;".join(liens), unsafe_allow_html=True)
 
 if not match_id:
     st.warning(
@@ -660,35 +669,57 @@ with st.expander("📜 Règles de conformité du prestataire (pour information)"
 def construire_rapport_excel():
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df_identite = pd.DataFrame(
-            {
-                "Champ": ["N° dossier Odicee", "N° dossier Prestataire", "Fiche", "Site"]
-                + [l[1] for l in lignes_html],
-                "Odicee": [id_odicee, "", fiche_odicee_match, adresse_site]
-                + [l[2] for l in lignes_html],
-                "Prestataire": ["", filenumber_presta, fiche_presta, ""]
-                + [l[3] for l in lignes_html],
-                "Détail écart": ["", "", "", ""] + [l[4] for l in lignes_html],
-            }
+        # ── Feuille unique "Comparaison" : identité dossier + administratif + technique ──
+        df_admin = pd.DataFrame(
+            [{"Champ": "Site", "Odicee": adresse_site, "Prestataire": "", "Détail écart": ""}]
+            + [
+                {"Champ": label, "Odicee": v_od, "Prestataire": v_pr, "Détail écart": detail}
+                for _, label, v_od, v_pr, detail in lignes_html
+            ]
         )
-        df_identite.to_excel(writer, sheet_name="Identification", index=False)
+
+        ligne_courante = 0
+        feuille = "Comparaison"
+        pd.DataFrame(
+            [{"Dossier": f"{id_odicee} (Odicee) / {filenumber_presta} (Prestataire)", "Fiche": fiche_odicee_match}]
+        ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+        ligne_courante += 3
+
+        df_admin.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+        ligne_courante += len(df_admin) + 3
 
         if export_technique:
             if export_technique["type"] == "table":
-                export_technique["df"].to_excel(writer, sheet_name="Données techniques", index=False)
+                pd.DataFrame([{"Champ": "── Données techniques ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
+                export_technique["df"].to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
             elif export_technique["type"] == "th158":
+                pd.DataFrame([{"Champ": "── Equipements Odicee ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
                 export_technique["odicee_df"].to_excel(
-                    writer, sheet_name="Equipements Odicee", index=False
+                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
                 )
+                ligne_courante += len(export_technique["odicee_df"]) + 3
+
+                pd.DataFrame([{"Champ": "── Equipements Prestataire ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
                 export_technique["presta_df"].to_excel(
-                    writer, sheet_name="Equipements Presta", index=False
+                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
                 )
+                ligne_courante += len(export_technique["presta_df"]) + 3
+
                 pd.DataFrame(
                     {
                         "Total": ["Odicee", "Prestataire"],
                         "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
                     }
-                ).to_excel(writer, sheet_name="Equipements - total", index=False)
+                ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
 
         df_regles = pd.DataFrame(
             [
