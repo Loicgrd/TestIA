@@ -857,14 +857,20 @@ elif "BAR-TH-158" in ref_upper:
     with col_od:
         st.markdown("**Odicee — tableau Equipements**")
         try:
-            st.table(odicee_rows) if odicee_rows else st.caption("Aucune ligne.")
+            if odicee_rows:
+                st.table(odicee_rows)
+            else:
+                st.caption("Aucune ligne.")
         except Exception as e:
             st.error(f"Affichage impossible pour ce tableau ({e}).")
             st.write(odicee_rows)
     with col_pr:
         st.markdown("**Prestataire — factures**")
         try:
-            st.table(presta_rows) if presta_rows else st.caption("Aucune ligne.")
+            if presta_rows:
+                st.table(presta_rows)
+            else:
+                st.caption("Aucune ligne.")
         except Exception as e:
             st.error(f"Affichage impossible pour ce tableau ({e}).")
             st.write(presta_rows)
@@ -954,6 +960,84 @@ with st.expander("📜 Règles de conformité du prestataire (pour information)"
             st.markdown(f"{icone} **{r.get('ruleId')}** — {r.get('message')}")
     else:
         st.caption("Aucune non-conformité signalée par le prestataire.")
+
+
+# ─────────────────────────────────────────────
+# EXPORT DU RAPPORT (Excel)
+# ─────────────────────────────────────────────
+
+def construire_rapport_excel():
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        # ── Feuille unique "Comparaison" : identité dossier + administratif + technique ──
+        df_admin = pd.DataFrame(
+            [{"Champ": "Site", "Odicee": adresse_site, "Prestataire": "", "Détail écart": ""}]
+            + [
+                {"Champ": label, "Odicee": v_od, "Prestataire": v_pr, "Détail écart": detail}
+                for _, label, v_od, v_pr, detail in lignes_html
+            ]
+        )
+
+        ligne_courante = 0
+        feuille = "Comparaison"
+        pd.DataFrame(
+            [{"Dossier": f"{id_odicee} (Odicee) / {filenumber_presta} (Prestataire)", "Fiche": fiche_odicee_match}]
+        ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+        ligne_courante += 3
+
+        df_admin.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+        ligne_courante += len(df_admin) + 3
+
+        if export_technique:
+            if export_technique["type"] == "table":
+                pd.DataFrame([{"Champ": "── Données techniques ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
+                export_technique["df"].to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+            elif export_technique["type"] == "th158":
+                pd.DataFrame([{"Champ": "── Equipements Odicee ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
+                export_technique["odicee_df"].to_excel(
+                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
+                )
+                ligne_courante += len(export_technique["odicee_df"]) + 3
+
+                pd.DataFrame([{"Champ": "── Equipements Prestataire ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
+                export_technique["presta_df"].to_excel(
+                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
+                )
+                ligne_courante += len(export_technique["presta_df"]) + 3
+
+                pd.DataFrame(
+                    {
+                        "Total": ["Odicee", "Prestataire"],
+                        "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
+                    }
+                ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+
+        df_regles = pd.DataFrame(
+            [
+                {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message")}
+                for r in non_conformes
+            ]
+        ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message"])
+        df_regles.to_excel(writer, sheet_name="Non-conformités prestataire", index=False)
+
+    return buffer.getvalue()
+
+
+st.download_button(
+    "📥 Télécharger le rapport (Excel)",
+    data=construire_rapport_excel(),
+    file_name=f"comparaison_{id_odicee}_{fiche_odicee_match}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+)
 
 
 # ─────────────────────────────────────────────
@@ -1047,6 +1131,33 @@ if fichier_zip_surlignage:
                     mime="application/pdf",
                 )
 
+                st.caption(
+                    "Génère un ZIP avec chaque document du dossier surligné (hors attestation "
+                    "sur l'honneur). Peut prendre du temps si plusieurs PDF sont scannés."
+                )
+                if st.button("Générer le ZIP de tous les documents surlignés"):
+                    zip_buffer_sel = io.BytesIO()
+                    with st.spinner("Surlignage de tous les documents en cours..."):
+                        with zipfile.ZipFile(zip_buffer_sel, "w", zipfile.ZIP_DEFLATED) as zout:
+                            barre_sel = st.progress(0.0)
+                            for i, doc_p in enumerate(documents_surlignables):
+                                nom_p = doc_p.get("fileName")
+                                nom_zip_p = trouver_fichier_zip(pdfs_zip, nom_p)
+                                if not nom_zip_p:
+                                    st.caption(f"⚠️ {nom_p} introuvable dans le ZIP — ignoré.")
+                                    continue
+                                pdf_bytes_p = pdfs_zip[nom_zip_p]
+                                valeurs_presta_p = valeurs_presta_document(doc_p)
+                                pdf_annote_p, _, _ = surligner_pdf(pdf_bytes_p, valeurs_presta_p, valeurs_odicee_pdf)
+                                zout.writestr(f"surligne_{nom_p}", pdf_annote_p)
+                                barre_sel.progress((i + 1) / len(documents_surlignables))
+                    st.download_button(
+                        "📥 Télécharger le ZIP",
+                        data=zip_buffer_sel.getvalue(),
+                        file_name=f"surlignage_{id_odicee}.zip",
+                        mime="application/zip",
+                    )
+
                 st.markdown("---")
                 doc_rendu_sel = fitz.open(stream=pdf_annote_sel, filetype="pdf")
                 for i in range(doc_rendu_sel.page_count):
@@ -1056,110 +1167,3 @@ if fichier_zip_surlignage:
                         caption=f"Page {i + 1}/{doc_rendu_sel.page_count}",
                         use_container_width=True,
                     )
-
-            st.markdown("---")
-            st.caption(
-                "Génère un ZIP avec chaque document du dossier surligné (hors attestation sur "
-                "l'honneur). Peut prendre du temps si plusieurs PDF sont scannés."
-            )
-            if st.button("Générer le ZIP de tous les documents surlignés"):
-                zip_buffer_sel = io.BytesIO()
-                with st.spinner("Surlignage de tous les documents en cours..."):
-                    with zipfile.ZipFile(zip_buffer_sel, "w", zipfile.ZIP_DEFLATED) as zout:
-                        barre_sel = st.progress(0.0)
-                        for i, doc_p in enumerate(documents_surlignables):
-                            nom_p = doc_p.get("fileName")
-                            nom_zip_p = trouver_fichier_zip(pdfs_zip, nom_p)
-                            if not nom_zip_p:
-                                st.caption(f"⚠️ {nom_p} introuvable dans le ZIP — ignoré.")
-                                continue
-                            pdf_bytes_p = pdfs_zip[nom_zip_p]
-                            valeurs_presta_p = valeurs_presta_document(doc_p)
-                            pdf_annote_p, _, _ = surligner_pdf(pdf_bytes_p, valeurs_presta_p, valeurs_odicee_pdf)
-                            zout.writestr(f"surligne_{nom_p}", pdf_annote_p)
-                            barre_sel.progress((i + 1) / len(documents_surlignables))
-                st.download_button(
-                    "📥 Télécharger le ZIP",
-                    data=zip_buffer_sel.getvalue(),
-                    file_name=f"surlignage_{id_odicee}.zip",
-                    mime="application/zip",
-                )
-
-
-# ─────────────────────────────────────────────
-# EXPORT DU RAPPORT (Excel)
-# ─────────────────────────────────────────────
-
-def construire_rapport_excel():
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # ── Feuille unique "Comparaison" : identité dossier + administratif + technique ──
-        df_admin = pd.DataFrame(
-            [{"Champ": "Site", "Odicee": adresse_site, "Prestataire": "", "Détail écart": ""}]
-            + [
-                {"Champ": label, "Odicee": v_od, "Prestataire": v_pr, "Détail écart": detail}
-                for _, label, v_od, v_pr, detail in lignes_html
-            ]
-        )
-
-        ligne_courante = 0
-        feuille = "Comparaison"
-        pd.DataFrame(
-            [{"Dossier": f"{id_odicee} (Odicee) / {filenumber_presta} (Prestataire)", "Fiche": fiche_odicee_match}]
-        ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-        ligne_courante += 3
-
-        df_admin.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-        ligne_courante += len(df_admin) + 3
-
-        if export_technique:
-            if export_technique["type"] == "table":
-                pd.DataFrame([{"Champ": "── Données techniques ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                export_technique["df"].to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-            elif export_technique["type"] == "th158":
-                pd.DataFrame([{"Champ": "── Equipements Odicee ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                export_technique["odicee_df"].to_excel(
-                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
-                )
-                ligne_courante += len(export_technique["odicee_df"]) + 3
-
-                pd.DataFrame([{"Champ": "── Equipements Prestataire ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                export_technique["presta_df"].to_excel(
-                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
-                )
-                ligne_courante += len(export_technique["presta_df"]) + 3
-
-                pd.DataFrame(
-                    {
-                        "Total": ["Odicee", "Prestataire"],
-                        "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
-                    }
-                ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-
-        df_regles = pd.DataFrame(
-            [
-                {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message")}
-                for r in non_conformes
-            ]
-        ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message"])
-        df_regles.to_excel(writer, sheet_name="Non-conformités prestataire", index=False)
-
-    return buffer.getvalue()
-
-
-st.markdown("---")
-st.download_button(
-    "📥 Télécharger le rapport (Excel)",
-    data=construire_rapport_excel(),
-    file_name=f"comparaison_{id_odicee}_{fiche_odicee_match}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
