@@ -393,6 +393,26 @@ def get_presta_technical_value(report, doc_type, cle_presta):
     return None, None
 
 
+def caster_comme_original(valeur_originale, nouvelle_valeur_texte):
+    """Convertit une valeur éditée (toujours du texte côté data_editor) dans le même type
+    que la valeur Odicee d'origine, pour ne pas corrompre le JSON (ex: un nombre stocké en
+    int ne doit pas devenir une chaîne après édition). Repli sur le texte tel quel si la
+    conversion échoue."""
+    if isinstance(valeur_originale, bool):
+        return nouvelle_valeur_texte
+    if isinstance(valeur_originale, int):
+        try:
+            return int(float(str(nouvelle_valeur_texte).replace(",", ".")))
+        except (TypeError, ValueError):
+            return nouvelle_valeur_texte
+    if isinstance(valeur_originale, float):
+        try:
+            return float(str(nouvelle_valeur_texte).replace(",", "."))
+        except (TypeError, ValueError):
+            return nouvelle_valeur_texte
+    return nouvelle_valeur_texte
+
+
 def get_presta_doc(report, doc_type):
     for doc in report.get("documents", []) or []:
         if doc.get("type") == doc_type:
@@ -841,6 +861,7 @@ st.markdown("#### 🔧 Données techniques")
 
 ref_upper = fiche_odicee_match.upper()
 export_technique = None  # rempli par chaque branche ci-dessous, utilisé pour l'export Excel
+modifications_odicee = []  # (fiche, cle_od, ancienne_valeur, nouvelle_valeur) — édité par l'utilisateur
 
 if "BAR-TH-106" in ref_upper:
     lignes_th106, note_th106 = comparer_th106(fd, report)
@@ -881,10 +902,31 @@ elif "BAR-TH-158" in ref_upper:
     )
     col_od, col_pr = st.columns(2)
     with col_od:
-        st.markdown("**Odicee — tableau Equipements**")
+        st.markdown("**Odicee — tableau Equipements ✏️**")
         try:
             if odicee_rows:
-                st.table(odicee_rows)
+                df_od_th158 = st.data_editor(
+                    pd.DataFrame(odicee_rows),
+                    hide_index=True,
+                    key=f"editeur_th158_{fiche_odicee_match}_{adresse_site}",
+                )
+                lignes_modifiees = df_od_th158.to_dict("records") != odicee_rows
+                if lignes_modifiees and isinstance(fd.get("Equipements"), dict):
+                    nouvelles_lignes = []
+                    for r in df_od_th158.to_dict("records"):
+                        qte = caster_comme_original(1, r.get("Quantité", ""))
+                        puissance = caster_comme_original(1, r.get("Puissance (W)", ""))
+                        nouvelles_lignes.append([
+                            r.get("Marque", ""), r.get("Référence", ""), r.get("N° certif NF", ""),
+                            qte, puissance,
+                        ])
+                    fd["Equipements"]["values"] = json.dumps(nouvelles_lignes, ensure_ascii=False)
+                    modifications_odicee.append(
+                        (fiche_odicee_match, "Equipements", odicee_rows, df_od_th158.to_dict("records"))
+                    )
+                    # Recalcule le total affiché plus haut avec les nouvelles quantités
+                    total_od = sum(normalise_nombre(r.get("Quantité")) or 0 for r in df_od_th158.to_dict("records"))
+                odicee_rows = df_od_th158.to_dict("records")
             else:
                 st.caption("Aucune ligne.")
         except Exception as e:
@@ -935,6 +977,13 @@ else:
         else:
             entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
             lignes = {c: [] for c in entete}
+            # Parallèle à `lignes` : clé formData brute et indicateur "champ encodé" (valeur
+            # affichée décodée par decoder_valeur, ex: type de pose 0/1 -> texte) pour chaque
+            # ligne éditable — on ne permet pas la modification des champs encodés ici, le
+            # risque de réinjecter un texte au lieu du code numérique attendu par Odicee est
+            # trop élevé pour un simple champ texte.
+            cles_od_lignes = []
+            encode_lignes = []
 
             for cle_od, label, unite, critique in regles_fiche:
                 if cle_od not in mapping_fiche:
@@ -965,13 +1014,45 @@ else:
                     v = valeurs_pr[dt]
                     lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
 
+                cles_od_lignes.append(cle_od)
+                encode_lignes.append(str(valeur_od_dec) != str(valeur_od))
+
             if lignes["Champ"]:
-                st.table(lignes)
+                df_lignes = pd.DataFrame(lignes)
+                colonnes_verrouillees = [c for c in df_lignes.columns if c != "Odicee"]
+                # Les champs encodés (liste déroulante Odicee ex: type de pose) restent en
+                # lecture seule : data_editor ne permet pas de désactiver une cellule isolée.
+                df_lignes["_editable"] = [not e for e in encode_lignes]
+
+                df_edite = st.data_editor(
+                    df_lignes.drop(columns=["_editable"]),
+                    disabled=colonnes_verrouillees + (["Odicee"] if all(encode_lignes) else []),
+                    column_config={
+                        "Odicee": st.column_config.TextColumn(
+                            "Odicee ✏️" if not all(encode_lignes) else "Odicee"
+                        )
+                    },
+                    hide_index=True,
+                    key=f"editeur_technique_{fiche_odicee_match}_{adresse_site}",
+                )
                 st.caption(
                     "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle (à vérifier "
-                    "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés."
+                    "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés. "
+                    "✏️ Colonne Odicee modifiable (les champs à liste déroulante — type de pose, "
+                    "classe de régulateur... — restent en lecture seule ici)."
                 )
-                export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
+
+                for i, cle_od in enumerate(cles_od_lignes):
+                    if encode_lignes[i]:
+                        continue
+                    valeur_originale = fd.get(cle_od)
+                    valeur_affichee_orig = lignes["Odicee"][i]
+                    valeur_editee = df_edite["Odicee"].iloc[i]
+                    if str(valeur_editee) != str(valeur_affichee_orig):
+                        fd[cle_od] = caster_comme_original(valeur_originale, valeur_editee)
+                        modifications_odicee.append((fiche_odicee_match, cle_od, valeur_affichee_orig, valeur_editee))
+
+                export_technique = {"type": "table", "titre": "Données techniques", "df": df_edite}
             else:
                 st.caption("Aucun champ mappé n'a de correspondance exploitable.")
 
@@ -1058,12 +1139,29 @@ def construire_rapport_excel():
     return buffer.getvalue()
 
 
-st.download_button(
-    "📥 Télécharger le rapport (Excel)",
-    data=construire_rapport_excel(),
-    file_name=f"comparaison_{id_odicee}_{fiche_odicee_match}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-)
+colex1, colex2 = st.columns(2)
+with colex1:
+    st.download_button(
+        "📥 Télécharger le rapport (Excel)",
+        data=construire_rapport_excel(),
+        file_name=f"comparaison_{id_odicee}_{fiche_odicee_match}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+with colex2:
+    if modifications_odicee:
+        st.download_button(
+            "📥 Télécharger le JSON Odicee modifié",
+            data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+            file_name=f"{id_odicee}_modifie.json",
+            mime="application/json",
+        )
+    else:
+        st.caption("Aucune modification apportée aux valeurs Odicee — rien à réexporter en JSON.")
+
+if modifications_odicee:
+    with st.expander(f"✏️ {len(modifications_odicee)} modification(s) apportée(s) aux valeurs Odicee"):
+        for fiche_mod, cle_mod, avant, apres in modifications_odicee:
+            st.caption(f"**{cle_mod}** ({fiche_mod}) : {avant} → {apres}")
 
 
 # ─────────────────────────────────────────────
