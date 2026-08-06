@@ -1202,7 +1202,7 @@ with colex1:
     st.download_button(
         "📥 Télécharger le rapport (Excel)",
         data=construire_rapport_excel(),
-        file_name=f"comparaison_{id_odicee}_{fiche_odicee_match}.xlsx",
+        file_name=f"{datetime.now().strftime('%Y-%m-%d')}_{id_odicee}_{fiche_odicee_match}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 with colex2:
