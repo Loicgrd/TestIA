@@ -495,10 +495,13 @@ def valeurs_odicee_dossier_pdf(fd, lot):
         if val not in (None, "") and not isinstance(val, (dict, list, bool)):
             valeurs.append((cle, val))
     prof = lot.get("professionnel") or {}
-    if prof.get("siret"):
-        valeurs.append(("SIRET professionnel", prof["siret"]))
-    if prof.get("raisonSociale"):
-        valeurs.append(("Raison sociale professionnel", prof["raisonSociale"]))
+    titulaire = lot.get("professionnelTitulaireSigneQualite")
+    if not (isinstance(titulaire, dict) and titulaire.get("siret")):
+        titulaire = prof  # repli si le titulaire RGE n'est pas renseigné pour ce lot
+    if titulaire.get("siret"):
+        valeurs.append(("SIRET professionnel", titulaire["siret"]))
+    if titulaire.get("raisonSociale"):
+        valeurs.append(("Raison sociale professionnel", titulaire["raisonSociale"]))
     return [(l, v) for l, v in valeurs if len(str(v).strip()) >= 3]
 
 
@@ -849,7 +852,13 @@ adresse_presta = (doc_realisation or {}).get("extractedFields", {}).get("worksAd
 rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 
 prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
-siret_odicee = prof.get("siret")
+# `professionnel` est souvent le maître d'œuvre (MAITRE_OEUVRE), pas l'installateur — le SIRET à
+# comparer aux documents prestataire (facture/RGE) est celui du professionnel RGE ayant réalisé
+# les travaux, stocké dans `professionnelTitulaireSigneQualite` quand il est renseigné.
+titulaire = lot.get("professionnelTitulaireSigneQualite")
+if not (isinstance(titulaire, dict) and titulaire.get("siret")):
+    titulaire = prof  # repli si le titulaire RGE n'est pas renseigné pour ce lot
+siret_odicee = titulaire.get("siret")
 siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
 rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
 
@@ -903,8 +912,8 @@ for i, label in enumerate(df_identite_edite["Champ"]):
         fd["adresse_travaux"] = valeur_editee
         modifications_odicee.append((fiche_odicee_match, "adresse_travaux", valeur_orig, valeur_editee))
     elif label == "SIRET professionnel":
-        prof["siret"] = valeur_editee
-        modifications_odicee.append((fiche_odicee_match, "professionnel.siret", valeur_orig, valeur_editee))
+        titulaire["siret"] = valeur_editee
+        modifications_odicee.append((fiche_odicee_match, "professionnelTitulaireSigneQualite.siret", valeur_orig, valeur_editee))
 
 # ── Comparaison technique champ par champ ──
 st.markdown("#### 🔧 Données techniques")
