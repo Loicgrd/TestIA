@@ -257,7 +257,7 @@ def comparer_th158(fd, report):
 
 # Types de documents prestataire dont les technicalFields portent des valeurs "techniques"
 # comparables au formData Odicee (on ignore VisaRequest/RgeCertificate qui n'en ont pas).
-DOC_TYPES_TECHNIQUES = ["HonorAttestation", "Invoice"]
+DOC_TYPES_TECHNIQUES = ["Invoice", "HonorAttestation"]
 LABEL_DOC_TYPE = {
     "HonorAttestation": "AH (prestataire)",
     "Invoice": "Facture (prestataire)",
