@@ -327,6 +327,17 @@ def fmt_date_any(v):
     return d.strftime("%d/%m/%Y") if d else v
 
 
+def date_str_vers_ts_ms(texte):
+    """Inverse de fmt_ts : convertit une date affichée (JJ/MM/AAAA ou autre format reconnu par
+    normalise_date) en timestamp millisecondes minuit Europe/Paris, pour réécriture dans le
+    JSON Odicee (dateEngagementReelle / dateRealisationReelle). None si non reconnu."""
+    d = normalise_date(texte)
+    if not d:
+        return None
+    dt = PARIS_TZ.localize(datetime(d.year, d.month, d.day))
+    return int(dt.timestamp() * 1000)
+
+
 def comparer(valeur_odicee, valeur_presta, tolerance=0.01):
     """Retourne (statut, detail) où statut ∈ {"ok", "ecart", "indeterminé", "manquant"}."""
     if valeur_odicee in (None, "") and (valeur_presta in (None, "")):
@@ -820,6 +831,7 @@ doc_realisation = (
 )
 
 rows_identite = []
+modifications_odicee = []  # (fiche, cle_od, ancienne_valeur, nouvelle_valeur) — édité par l'utilisateur
 
 date_eng_odicee = fmt_ts(data.get("dateEngagementReelle"))
 date_eng_presta = (doc_engagement or {}).get("extractedFields", {}).get("documentDate") or \
@@ -836,7 +848,7 @@ adresse_fd = " ".join(filter(None, [
 adresse_presta = (doc_realisation or {}).get("extractedFields", {}).get("worksAddress")
 rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 
-prof = lot.get("professionnel") or {}
+prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
 siret_odicee = prof.get("siret")
 siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
 rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
@@ -846,7 +858,7 @@ for label, v_od, v_pr in rows_identite:
     statut, detail = comparer(v_od, v_pr, tolerance=0)
     lignes_html.append((badge(statut), label, v_od if v_od else "—", v_pr if v_pr else "—", detail or ""))
 
-st.table(
+df_identite = pd.DataFrame(
     {
         "": [l[0] for l in lignes_html],
         "Champ": [l[1] for l in lignes_html],
@@ -855,13 +867,50 @@ st.table(
         "Détail écart": [l[4] for l in lignes_html],
     }
 )
+df_identite_edite = st.data_editor(
+    df_identite,
+    disabled=["", "Champ", "Prestataire", "Détail écart"],
+    column_config={"Odicee": st.column_config.TextColumn("Odicee ✏️")},
+    hide_index=True,
+    key=f"editeur_identite_{fiche_odicee_match}_{adresse_site}",
+)
+st.caption(
+    "✏️ Colonne Odicee modifiable. Dates au format JJ/MM/AAAA. L'adresse remplace le champ "
+    "« adresse des travaux » d'Odicee dans son intégralité (code postal/ville restent séparés "
+    "et ne sont pas modifiables ici)."
+)
+
+for i, label in enumerate(df_identite_edite["Champ"]):
+    valeur_orig = lignes_html[i][2]
+    valeur_editee = df_identite_edite["Odicee"].iloc[i]
+    if str(valeur_editee) == str(valeur_orig):
+        continue
+    if label == "Date d'engagement":
+        ts = date_str_vers_ts_ms(valeur_editee)
+        if ts is not None:
+            data["dateEngagementReelle"] = ts
+            modifications_odicee.append((fiche_odicee_match, "dateEngagementReelle", valeur_orig, valeur_editee))
+        else:
+            st.warning(f"Date d'engagement « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
+    elif label == "Date de réalisation":
+        ts = date_str_vers_ts_ms(valeur_editee)
+        if ts is not None:
+            data["dateRealisationReelle"] = ts
+            modifications_odicee.append((fiche_odicee_match, "dateRealisationReelle", valeur_orig, valeur_editee))
+        else:
+            st.warning(f"Date de réalisation « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
+    elif label == "Adresse des travaux":
+        fd["adresse_travaux"] = valeur_editee
+        modifications_odicee.append((fiche_odicee_match, "adresse_travaux", valeur_orig, valeur_editee))
+    elif label == "SIRET professionnel":
+        prof["siret"] = valeur_editee
+        modifications_odicee.append((fiche_odicee_match, "professionnel.siret", valeur_orig, valeur_editee))
 
 # ── Comparaison technique champ par champ ──
 st.markdown("#### 🔧 Données techniques")
 
 ref_upper = fiche_odicee_match.upper()
 export_technique = None  # rempli par chaque branche ci-dessous, utilisé pour l'export Excel
-modifications_odicee = []  # (fiche, cle_od, ancienne_valeur, nouvelle_valeur) — édité par l'utilisateur
 
 if "BAR-TH-106" in ref_upper:
     lignes_th106, note_th106 = comparer_th106(fd, report)
