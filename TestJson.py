@@ -400,6 +400,23 @@ def get_presta_doc(report, doc_type):
     return None
 
 
+def get_presta_doc_par_regle(report, rule_id):
+    """Retrouve le document identifié par le prestataire lui-même comme preuve d'engagement
+    ou de réalisation, via ses globalRules (DOSSIER_HAS_ENGAGEMENT / DOSSIER_HAS_COMPLETION)
+    dont le champ 'evidence' contient le nom du fichier concerné. Plus fiable qu'une liste de
+    types de documents à deviner : le document "preuve d'engagement" est tantôt un acte
+    d'engagement (EngagementAct), un bon de commande (PurchaseOrder), un ordre de service
+    (ServiceOrder)... selon le dossier — et ce n'est JAMAIS le VisaRequest, qui date la demande
+    de contrôle et non l'engagement des travaux."""
+    for r in report.get("globalRules", []) or []:
+        if r.get("ruleId") == rule_id and r.get("evidence"):
+            nom_fichier = r["evidence"]
+            for doc in report.get("documents", []) or []:
+                if doc.get("fileName") == nom_fichier:
+                    return doc
+    return None
+
+
 # ─────────────────────────────────────────────
 # SURLIGNAGE PDF (repris de 5_Surlignage_PDF.py)
 # ─────────────────────────────────────────────
@@ -770,8 +787,17 @@ st.markdown(f"### 📋 Fiche comparée : **{fiche_odicee_match}** — {adresse_s
 
 # ── Comparaison des dates & identité chantier (niveau dossier) ──
 st.markdown("#### 📅 Dates & identité chantier")
-doc_engagement = get_presta_doc(report, "LetterOfCommand") or get_presta_doc(report, "VisaRequest")
-doc_realisation = get_presta_doc(report, "Invoice")
+doc_engagement = (
+    get_presta_doc_par_regle(report, "DOSSIER_HAS_ENGAGEMENT")
+    or get_presta_doc(report, "EngagementAct")
+    or get_presta_doc(report, "PurchaseOrder")
+    or get_presta_doc(report, "ServiceOrder")
+    or get_presta_doc(report, "LetterOfCommand")
+)
+doc_realisation = (
+    get_presta_doc_par_regle(report, "DOSSIER_HAS_COMPLETION")
+    or get_presta_doc(report, "Invoice")
+)
 
 rows_identite = []
 
