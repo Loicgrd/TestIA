@@ -213,23 +213,26 @@ def comparer_th106(fd, report):
             )
 
     champs = [
-        ("Marque/référence chaudière", "boiler", "boilerBrand"),
-        ("Quantité chaudières", "quantite", "quantity"),
-        ("Puissance nominale (kW)", "puissance_kw", "nominalPowerKw"),
-        ("ETAS (%)", "etas", "etasPercent"),
-        ("Marque régulateur", "regulateur", "regulatorBrand"),
-        ("Classe régulateur", "classe", "regulatorClass"),
+        ("Marque/référence chaudière", "boiler", "boilerBrand", None),
+        ("Quantité chaudières", "quantite", "quantity", "nb_equipements"),
+        ("Puissance nominale (kW)", "puissance_kw", "nominalPowerKw", "puissance_thermique_nominale"),
+        ("ETAS (%)", "etas", "etasPercent", "efficacite_energetique"),
+        ("Marque régulateur", "regulateur", "regulatorBrand", "marque_regulateur"),
+        ("Classe régulateur", "classe", "regulatorClass", None),
     ]
+    # Édition manuelle possible uniquement dans le cas "individuel" (colonnes directes) : le cas
+    # "collectif" (tableau Puissance multi-lignes) n'est pas réinjectable simplement en JSON ici.
+    editable = not lignes_table
 
     lignes = []
-    for label, cle_od, cle_pr in champs:
+    for label, cle_od, cle_pr, cle_ecriture in champs:
         valeur_od = odicee_vals.get(cle_od)
         valeurs_pr = {}
         for dt in DOC_TYPES_TECHNIQUES:
             v, _ = get_presta_technical_value(report, dt, cle_pr)
             valeurs_pr[dt] = v
-        lignes.append((label, valeur_od, valeurs_pr))
-    return lignes, note
+        lignes.append((label, valeur_od, valeurs_pr, cle_ecriture if editable else None))
+    return lignes, note, editable
 
 
 def comparer_th158(fd, report):
@@ -441,17 +444,25 @@ def caster_comme_original(valeur_originale, nouvelle_valeur_texte):
     """Convertit une valeur éditée (toujours du texte côté data_editor) dans le même type
     que la valeur Odicee d'origine, pour ne pas corrompre le JSON (ex: un nombre stocké en
     int ne doit pas devenir une chaîne après édition). Repli sur le texte tel quel si la
-    conversion échoue."""
+    conversion échoue. Si le texte saisi contient une décimale (ex: puissance exacte en kW
+    tapée à la main sur un champ normalement entier/booléen côté Odicee), la décimale est
+    conservée plutôt que tronquée — l'intention de l'utilisateur prime sur le type d'origine."""
     if isinstance(valeur_originale, bool):
         return nouvelle_valeur_texte
+    texte = str(nouvelle_valeur_texte).replace(",", ".")
     if isinstance(valeur_originale, int):
+        if "." in texte:
+            try:
+                return float(texte)
+            except (TypeError, ValueError):
+                return nouvelle_valeur_texte
         try:
-            return int(float(str(nouvelle_valeur_texte).replace(",", ".")))
+            return int(float(texte))
         except (TypeError, ValueError):
             return nouvelle_valeur_texte
     if isinstance(valeur_originale, float):
         try:
-            return float(str(nouvelle_valeur_texte).replace(",", "."))
+            return float(texte)
         except (TypeError, ValueError):
             return nouvelle_valeur_texte
     return nouvelle_valeur_texte
@@ -973,13 +984,14 @@ ref_upper = fiche_odicee_match.upper()
 export_technique = None  # rempli par chaque branche ci-dessous, utilisé pour l'export Excel
 
 if "BAR-TH-106" in ref_upper:
-    lignes_th106, note_th106 = comparer_th106(fd, report)
+    lignes_th106, note_th106, editable_th106 = comparer_th106(fd, report)
     if note_th106:
         st.info(note_th106)
     docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc(report, dt)]
     entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
     lignes = {c: [] for c in entete}
-    for label, valeur_od, valeurs_pr in lignes_th106:
+    cles_ecriture_th106 = []
+    for label, valeur_od, valeurs_pr, cle_ecriture in lignes_th106:
         # Le badge de statut ne reflète que l'écart Odicee <-> Facture ; l'AH n'est qu'une
         # information affichée en plus, elle ne doit pas influencer la conclusion (déclaration
         # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
@@ -990,13 +1002,43 @@ if "BAR-TH-106" in ref_upper:
         for dt in docs_presents:
             v = valeurs_pr.get(dt)
             lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
-    st.table(lignes)
-    st.caption(
-        "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
-        "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
-        "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain)."
-    )
-    export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
+        cles_ecriture_th106.append(cle_ecriture)
+
+    if editable_th106:
+        df_th106 = pd.DataFrame(lignes)
+        colonnes_verrouillees_th106 = [c for c in df_th106.columns if c != "Odicee"]
+        df_th106_edite = st.data_editor(
+            df_th106,
+            disabled=colonnes_verrouillees_th106,
+            column_config={"Odicee": st.column_config.TextColumn("Odicee ✏️")},
+            hide_index=True,
+            key=f"editeur_th106_{fiche_odicee_match}_{adresse_site}",
+        )
+        st.caption(
+            "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
+            "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
+            "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain). "
+            "✏️ Colonne Odicee modifiable, sauf marque/référence chaudière et classe régulateur "
+            "(champs composites/à liste déroulante, non réinjectables tels quels ici)."
+        )
+        for i, cle_ecriture in enumerate(cles_ecriture_th106):
+            if not cle_ecriture:
+                continue
+            valeur_orig_affichee = lignes["Odicee"][i]
+            valeur_editee = df_th106_edite["Odicee"].iloc[i]
+            if str(valeur_editee) != str(valeur_orig_affichee):
+                fd[cle_ecriture] = caster_comme_original(fd.get(cle_ecriture), valeur_editee)
+                modifications_odicee.append((fiche_odicee_match, cle_ecriture, valeur_orig_affichee, valeur_editee))
+        export_technique = {"type": "table", "titre": "Données techniques", "df": df_th106_edite}
+    else:
+        st.table(lignes)
+        st.caption(
+            "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
+            "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
+            "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain). "
+            "Tableau non modifiable ici (cas « collectif », structure multi-chaudières)."
+        )
+        export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
 
 elif "BAR-TH-158" in ref_upper:
     odicee_rows, presta_rows, total_od, total_pr = comparer_th158(fd, report)
