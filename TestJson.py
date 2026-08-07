@@ -941,10 +941,11 @@ if "BAR-TH-106" in ref_upper:
     entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
     lignes = {c: [] for c in entete}
     for label, valeur_od, valeurs_pr in lignes_th106:
-        statuts = [comparer(valeur_od, valeurs_pr.get(dt))[0] for dt in docs_presents]
-        ordre_gravite = {"ecart": 0, "indetermine": 1, "manquant": 2, "ok": 3}
-        pire = min(statuts, key=lambda s: ordre_gravite[s]) if statuts else "manquant"
-        lignes[""].append(badge(pire))
+        # Le badge de statut ne reflète que l'écart Odicee <-> Facture ; l'AH n'est qu'une
+        # information affichée en plus, elle ne doit pas influencer la conclusion (déclaration
+        # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
+        statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
+        lignes[""].append(badge(statut_badge))
         lignes["Champ"].append(label)
         lignes["Odicee"].append(valeur_od if valeur_od not in (None, "") else "—")
         for dt in docs_presents:
@@ -952,8 +953,9 @@ if "BAR-TH-106" in ref_upper:
             lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
     st.table(lignes)
     st.caption(
-        "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté. "
-        "Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain)."
+        "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
+        "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
+        "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain)."
     )
     export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
 
@@ -1067,15 +1069,12 @@ else:
                     v, _fname = get_presta_technical_value(report, dt, cle_pr)
                     valeurs_pr[dt] = v
 
-                # Statut global de la ligne = pire statut parmi les documents comparés
-                statuts = []
-                for dt in docs_presents:
-                    statut, _ = comparer(valeur_od, valeurs_pr[dt])
-                    statuts.append(statut)
-                ordre_gravite = {"ecart": 0, "indetermine": 1, "manquant": 2, "ok": 3}
-                pire = min(statuts, key=lambda s: ordre_gravite[s]) if statuts else "manquant"
+                # Statut du badge = comparaison Odicee <-> Facture uniquement ; l'AH reste
+                # affichée à titre d'information mais n'influence pas la conclusion (déclaration
+                # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
+                statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
 
-                lignes[""].append(badge(pire))
+                lignes[""].append(badge(statut_badge))
                 lignes["Champ"].append(f"{label}" + (f" ({unite})" if unite else ""))
                 lignes["Odicee"].append(
                     f"{valeur_od_dec}" if valeur_od_dec not in (None, "") else "—"
@@ -1107,7 +1106,9 @@ else:
                 )
                 st.caption(
                     "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle (à vérifier "
-                    "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés. "
+                    "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés — "
+                    "comparaison Odicee vs Facture uniquement (l'AH est affichée à titre informatif et "
+                    "n'influence pas la couleur). "
                     "✏️ Colonne Odicee modifiable (les champs à liste déroulante — type de pose, "
                     "classe de régulateur... — restent en lecture seule ici)."
                 )
