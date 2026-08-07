@@ -925,7 +925,7 @@ rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
 lignes_html = []
 for label, v_od, v_pr in rows_identite:
     statut, detail = comparer(v_od, v_pr, tolerance=0)
-    lignes_html.append((badge(statut), label, v_od if v_od else "—", v_pr if v_pr else "—", detail or ""))
+    lignes_html.append((badge(statut), label, f"{v_od}" if v_od else "—", f"{v_pr}" if v_pr else "—", detail or ""))
 
 df_identite = pd.DataFrame(
     {
@@ -998,7 +998,7 @@ if "BAR-TH-106" in ref_upper:
         statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
         lignes[""].append(badge(statut_badge))
         lignes["Champ"].append(label)
-        lignes["Odicee"].append(valeur_od if valeur_od not in (None, "") else "—")
+        lignes["Odicee"].append(f"{valeur_od}" if valeur_od not in (None, "") else "—")
         for dt in docs_presents:
             v = valeurs_pr.get(dt)
             lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
