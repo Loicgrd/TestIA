@@ -104,6 +104,10 @@ FIELD_MAPPING = {
         "reference_fenetre": "productReference",
         "surface_fenetres": "surfaceM2",
         "nombre_de_fenetres_ou_portefenetres": "quantity",
+        # Variante des clés Odicee avant le 01/01/2024 (cf. champs_en104 dans utils.py) — même
+        # champ prestataire des deux côtés, seule la clé formData change selon la date d'engagement.
+        "marque_isolant": "brand",
+        "reference_isolant": "productReference",
     },
     # BAR-TH-110 : "hasLowTempMention" (mention basse température) n'a pas d'équivalent
     # structuré côté Odicee — non comparable automatiquement.
