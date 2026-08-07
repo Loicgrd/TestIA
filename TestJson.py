@@ -443,6 +443,22 @@ def get_presta_doc(report, doc_type):
     return None
 
 
+def get_presta_works_address(report, doc_realisation, doc_engagement):
+    """L'adresse des travaux n'est pas toujours renseignée sur la facture (OCR manqué, mention
+    absente...) alors qu'elle l'est souvent sur le bon de commande / acte d'engagement. On
+    cherche dans l'ordre : document de réalisation, document d'engagement, puis n'importe quel
+    autre document du dossier — pour ne pas afficher '—' alors que l'info existe ailleurs.
+    Retourne (adresse, nom_du_fichier_source) ou (None, None)."""
+    for doc in (doc_realisation, doc_engagement):
+        if doc and (doc.get("extractedFields") or {}).get("worksAddress"):
+            return doc["extractedFields"]["worksAddress"], doc.get("fileName")
+    for doc in report.get("documents", []) or []:
+        wa = (doc.get("extractedFields") or {}).get("worksAddress")
+        if wa:
+            return wa, doc.get("fileName")
+    return None, None
+
+
 def get_presta_doc_par_regle(report, rule_id):
     """Retrouve le document identifié par le prestataire lui-même comme preuve d'engagement
     ou de réalisation, via ses globalRules (DOSSIER_HAS_ENGAGEMENT / DOSSIER_HAS_COMPLETION)
@@ -860,7 +876,7 @@ rows_identite.append(("Date de réalisation", date_real_odicee, fmt_date_any(dat
 adresse_fd = " ".join(filter(None, [
     fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
 ])) or None
-adresse_presta = (doc_realisation or {}).get("extractedFields", {}).get("worksAddress")
+adresse_presta, doc_adresse_presta = get_presta_works_address(report, doc_realisation, doc_engagement)
 rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 
 prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
@@ -900,6 +916,8 @@ st.caption(
     "« adresse des travaux » d'Odicee dans son intégralité (code postal/ville restent séparés "
     "et ne sont pas modifiables ici)."
 )
+if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisation.get("fileName"):
+    st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
 
 for i, label in enumerate(df_identite_edite["Champ"]):
     valeur_orig = lignes_html[i][2]
