@@ -391,16 +391,24 @@ def get_odicee_lots_bar(data):
     return lots_par_fiche
 
 
+# Certains dossiers utilisent un type de document alternatif pour la facture (ex: "CeeInvoice"
+# au lieu de "Invoice") — parfois même en présence des deux, l'un des deux étant vide côté
+# extraction. On essaie chaque type candidat dans l'ordre et on garde la première valeur non
+# vide trouvée, plutôt que de s'arrêter sur un premier document dont l'extraction a échoué.
+TYPES_ALTERNATIFS = {"Invoice": ["Invoice", "CeeInvoice"]}
+
+
 def get_presta_technical_value(report, doc_type, cle_presta):
-    for doc in report.get("documents", []) or []:
-        if doc.get("type") != doc_type:
-            continue
-        tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
-        if cle_presta in tf:
-            return tf[cle_presta], doc.get("fileName")
-        ef = doc.get("extractedFields") or {}
-        if cle_presta in ef:
-            return ef[cle_presta], doc.get("fileName")
+    for dt in TYPES_ALTERNATIFS.get(doc_type, [doc_type]):
+        for doc in report.get("documents", []) or []:
+            if doc.get("type") != dt:
+                continue
+            tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
+            if tf.get(cle_presta) not in (None, ""):
+                return tf[cle_presta], doc.get("fileName")
+            ef = doc.get("extractedFields") or {}
+            if ef.get(cle_presta) not in (None, ""):
+                return ef[cle_presta], doc.get("fileName")
     return None, None
 
 
