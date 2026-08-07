@@ -179,9 +179,19 @@ def comparer_th106(fd, report):
             "classe": ROMAIN_VERS_ARABE.get(r0[5], r0[5]) if len(r0) > 5 else None,
         }
     else:
+        marque = fd.get("marque_chaudiere")
+        reference = fd.get("reference_chaudiere")
+        boiler = " ".join(filter(None, [str(marque or ""), str(reference or "")])).strip() or None
+        # nb_equipements n'est réellement renseigné par Odicee que lorsque le lot est en saisie
+        # multiple (plusieurs chaudières identiques) ; sur un lot simple (1 logement,
+        # is_multiple_entry=0) c'est une valeur par défaut (0) non significative.
+        # puissance_thermique_nominale n'est PAS une puissance en kW comparable à celle du
+        # prestataire : c'est une case Oui/Non ("Puissance ≤ 70 kW ?") encodée en 0/1 côté
+        # Odicee individuel — jamais comparée ici pour éviter un faux écart trompeur.
+        saisie_multiple = fd.get("is_multiple_entry") == 1
         odicee_vals = {
-            "boiler": fd.get("marque_chaudiere"),
-            "quantite": None,
+            "boiler": boiler,
+            "quantite": fd.get("nb_equipements") if saisie_multiple else None,
             "puissance_kw": None,
             "etas": fd.get("efficacite_energetique"),
             "regulateur": fd.get("marque_regulateur"),
@@ -190,6 +200,17 @@ def comparer_th106(fd, report):
                 fd.get("classe_regulateur"),
             ),
         }
+        if saisie_multiple:
+            note = (
+                "ℹ️ Puissance non comparée : Odicee ne stocke ici qu'un seuil Oui/Non "
+                "(« ≤ 70 kW ? »), pas une valeur en kW comparable à celle du prestataire."
+            )
+        else:
+            note = (
+                "ℹ️ Lot en saisie simple (1 logement, une seule chaudière) : quantité non "
+                "comparée (implicitement 1 unité). Puissance non comparée non plus : Odicee ne "
+                "stocke qu'un seuil Oui/Non (« ≤ 70 kW ? »), pas une valeur en kW."
+            )
 
     champs = [
         ("Marque/référence chaudière", "boiler", "boilerBrand"),
