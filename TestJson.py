@@ -440,6 +440,47 @@ def get_presta_technical_value(report, doc_type, cle_presta):
     return None, None
 
 
+def trouver_professionnel_installateur(data, lot):
+    """Retrouve le professionnel qui a réellement réalisé les travaux (SIRET à comparer aux
+    documents prestataire), PAS le maître d'œuvre ni un mandataire/apporteur d'affaire signataire
+    de la partie C — ces deux rôles se logent parfois dans lot.professionnel selon les dossiers.
+
+    Ordre de résolution :
+    1. lot.professionnelTitulaireSigneQualite si renseigné (le plus fiable, rattaché au lot).
+    2. data.dossierProfessionnels : recherche d'entrées de type "INSTALLATEUR" — utilisée
+       UNIQUEMENT s'il n'y en a qu'une seule de façon certaine (SIRET unique). Un dossier
+       multi-lots peut avoir plusieurs installateurs différents sans champ reliant chacun à
+       son lot précis dans le JSON : dans ce cas on ne devine pas, on retombe sur lot.professionnel
+       avec un avertissement.
+    3. lot.professionnel en dernier recours (peut être le mandataire/maître d'œuvre — ambigu).
+
+    Retourne (dict_professionnel, avertissement_ou_None)."""
+    titulaire = lot.get("professionnelTitulaireSigneQualite")
+    if isinstance(titulaire, dict) and titulaire.get("siret"):
+        return titulaire, None
+
+    installateurs = []
+    sirets_vus = set()
+    for dp in data.get("dossierProfessionnels", []) or []:
+        if dp.get("type") == "INSTALLATEUR":
+            p = dp.get("professionnel") or {}
+            if p.get("siret") and p["siret"] not in sirets_vus:
+                sirets_vus.add(p["siret"])
+                installateurs.append(p)
+    if len(installateurs) == 1:
+        return installateurs[0], None
+
+    prof = lot.get("professionnel") or {}
+    if len(installateurs) > 1:
+        return prof, (
+            f"⚠️ {len(installateurs)} installateurs différents identifiés au niveau du dossier "
+            "(dossierProfessionnels), sans rattachement fiable à ce lot précis dans le JSON — "
+            "le SIRET affiché (professionnel du lot) peut être un mandataire/maître d'œuvre plutôt "
+            "que l'installateur réel. À vérifier manuellement."
+        )
+    return prof, None
+
+
 def caster_comme_original(valeur_originale, nouvelle_valeur_texte):
     """Convertit une valeur éditée (toujours du texte côté data_editor) dans le même type
     que la valeur Odicee d'origine, pour ne pas corrompre le JSON (ex: un nombre stocké en
@@ -540,7 +581,7 @@ def valeurs_presta_document(doc_presta):
     return [(l, v) for l, v in valeurs if len(str(v).strip()) >= 3]
 
 
-def valeurs_odicee_dossier_pdf(fd, lot):
+def valeurs_odicee_dossier_pdf(fd, lot, data):
     """Valeurs Odicee repérables sur un PDF : champs techniques du lot (formData) + identité
     du professionnel. Pas de notion de document associé côté Odicee — cherché sur tous les PDF."""
     valeurs = []
@@ -554,10 +595,7 @@ def valeurs_odicee_dossier_pdf(fd, lot):
             continue
         if val not in (None, "") and not isinstance(val, (dict, list, bool)):
             valeurs.append((cle, val))
-    prof = lot.get("professionnel") or {}
-    titulaire = lot.get("professionnelTitulaireSigneQualite")
-    if not (isinstance(titulaire, dict) and titulaire.get("siret")):
-        titulaire = prof  # repli si le titulaire RGE n'est pas renseigné pour ce lot
+    titulaire, _avertissement = trouver_professionnel_installateur(data, lot)
     if titulaire.get("siret"):
         valeurs.append(("SIRET professionnel", titulaire["siret"]))
     if titulaire.get("raisonSociale"):
@@ -912,12 +950,10 @@ adresse_presta, doc_adresse_presta = get_presta_works_address(report, doc_realis
 rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 
 prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
-# `professionnel` est souvent le maître d'œuvre (MAITRE_OEUVRE), pas l'installateur — le SIRET à
-# comparer aux documents prestataire (facture/RGE) est celui du professionnel RGE ayant réalisé
-# les travaux, stocké dans `professionnelTitulaireSigneQualite` quand il est renseigné.
-titulaire = lot.get("professionnelTitulaireSigneQualite")
-if not (isinstance(titulaire, dict) and titulaire.get("siret")):
-    titulaire = prof  # repli si le titulaire RGE n'est pas renseigné pour ce lot
+# `professionnel` est tantôt le maître d'œuvre, tantôt un mandataire/apporteur d'affaire — jamais
+# fiable à l'aveugle. Le SIRET à comparer aux documents prestataire (facture/RGE) est celui du
+# professionnel RGE ayant réalisé les travaux : voir trouver_professionnel_installateur().
+titulaire, avertissement_installateur = trouver_professionnel_installateur(data, lot)
 siret_odicee = titulaire.get("siret")
 siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
 rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
@@ -950,6 +986,8 @@ st.caption(
 )
 if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisation.get("fileName"):
     st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
+if avertissement_installateur:
+    st.warning(avertissement_installateur)
 
 for i, label in enumerate(df_identite_edite["Champ"]):
     valeur_orig = lignes_html[i][2]
@@ -1355,7 +1393,7 @@ if fichier_zip_surlignage:
         if not documents_surlignables:
             st.warning("Aucun document surlignable dans ce rapport (l'attestation sur l'honneur est exclue).")
         else:
-            valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot)
+            valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot, data)
 
             noms_docs_pdf = [d.get("fileName") for d in documents_surlignables if d.get("fileName")]
             doc_choisi_nom_pdf = st.selectbox("Document à surligner :", noms_docs_pdf, key="doc_surlignage")
