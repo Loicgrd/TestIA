@@ -122,6 +122,10 @@ FIELD_MAPPING = {
     # et puissances prestataire (caissonsQty, weightedAbsorbedPower...) recoupent des notions
     # calculées côté Odicee (puissance_individuelle/collective, unités différentes selon le
     # type d'installation) : à vérifier manuellement pour l'instant.
+    # BAR-TH-127 : marques/références + surface habitable + puissance individuelle (WThC, même
+    # unité que weightedAbsorbedPower côté prestataire — vérifié). puissance_collective reste
+    # exclue : exprimée en WThC/m3/h côté Odicee, une unité différente de weightedAbsorbedPower,
+    # la comparer directement produirait un faux résultat plutôt qu'une vraie non-concordance.
     "BAR-TH-127": {
         "marque_caisson": "caissonsBrand",
         "reference_caisson": "caissonsReference",
@@ -129,6 +133,8 @@ FIELD_MAPPING = {
         "reference_bouches_entree_air": "entreesAirReference",
         "marque_bouches_extraction": "bouchesBrand",
         "reference_bouches_extraction": "bouchesReference",
+        "surface_habitable": "surfaceHabitable",
+        "puissance_individuelle": "weightedAbsorbedPower",
     },
     # BAR-TH-106 et BAR-TH-158 : structure en tableau (multi-équipements) côté Odicee, gérées
     # à part par comparer_th106() et comparer_th158() plus bas — volontairement absentes d'ici.
@@ -210,6 +216,7 @@ def comparer_th106(fd, report):
             "etas": fd.get("efficacite_energetique"),
             "marque_regulateur": fd.get("marque_regulateur"),
             "reference_regulateur": fd.get("reference_regulateur"),
+            "surface_habitable": fd.get("surface_habitable"),
             "classe": ROMAIN_VERS_ARABE.get(
                 decoder_valeur("BAR-TH-106", "classe_regulateur", fd.get("classe_regulateur")),
                 fd.get("classe_regulateur"),
@@ -223,6 +230,7 @@ def comparer_th106(fd, report):
             ("Marque régulateur", "marque_regulateur", "regulatorBrand", "marque_regulateur"),
             ("Référence régulateur", "reference_regulateur", "regulatorReference", "reference_regulateur"),
             ("Classe régulateur", "classe", "regulatorClass", None),
+            ("Surface habitable (m²)", "surface_habitable", "surfaceHabitable", "surface_habitable"),
         ]
         if saisie_multiple:
             note = (
