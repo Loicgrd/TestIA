@@ -534,29 +534,6 @@ def trouver_professionnel_installateur(data, lot, siret_cible=None):
     return prof, None
 
 
-def detecter_sous_traitance(report, siret_titulaire):
-    """Signale une sous-traitance potentielle : présence d'une déclaration de sous-traitance
-    (DC4) et/ou d'un certificat RGE au nom d'une entreprise différente du titulaire ayant
-    facturé. Le SIRET facture reste celui de l'émetteur de la facture (le titulaire) — c'est
-    normal et pas une erreur d'extraction — mais le SIRET RGE réellement mobilisé pour la
-    fiche technique peut être celui du sous-traitant : à vérifier manuellement dans ce cas.
-    Retourne un message d'info ou None."""
-    a_dc4 = any(d.get("type") == "SubcontractingDeclaration" for d in report.get("documents", []) or [])
-    doc_rge = get_presta_doc(report, "RgeCertificate")
-    siret_rge = (doc_rge or {}).get("extractedFields", {}).get("siret")
-    societe_rge = (doc_rge or {}).get("extractedFields", {}).get("companyName")
-
-    if a_dc4 and siret_rge and siret_titulaire and siret_rge != siret_titulaire:
-        return (
-            f"ℹ️ Sous-traitance détectée (déclaration DC4 présente) : le SIRET facture "
-            f"correspond au titulaire qui a émis la facture, mais le certificat RGE mobilisé "
-            f"pour cette fiche est au nom d'une autre entreprise (**{societe_rge or '—'}**, "
-            f"SIRET {siret_rge}) — probablement le sous-traitant réel. Ce n'est pas une erreur "
-            "du prestataire, juste une nuance à garder en tête pour le contrôle."
-        )
-    return None
-
-
 def caster_comme_original(valeur_originale, nouvelle_valeur_texte):
     """Convertit une valeur éditée (toujours du texte côté data_editor) dans le même type
     que la valeur Odicee d'origine, pour ne pas corrompre le JSON (ex: un nombre stocké en
@@ -1039,6 +1016,21 @@ titulaire, avertissement_installateur = trouver_professionnel_installateur(data,
 siret_odicee = titulaire.get("siret")
 rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
 
+# Sous-traitant : n'affiché que si au moins un côté en a un (dossier avec DC4 / RGE distinct
+# du titulaire), pour ne pas ajouter une ligne "—/—" sur les dossiers sans sous-traitance.
+sous_traitant_od = lot.get("professionnelSousTraitant")
+sous_traitant_od = sous_traitant_od if isinstance(sous_traitant_od, dict) else {}
+siret_sous_traitant_od = sous_traitant_od.get("siret")
+
+doc_rge = get_presta_doc(report, "RgeCertificate")
+siret_rge = (doc_rge or {}).get("extractedFields", {}).get("siret")
+# Le RGE n'est un "sous-traitant côté prestataire" que s'il diffère du titulaire (sinon c'est
+# simplement le certificat RGE du titulaire lui-même, rien d'anormal).
+siret_sous_traitant_presta = siret_rge if (siret_rge and siret_rge != siret_odicee) else None
+
+if siret_sous_traitant_od or siret_sous_traitant_presta:
+    rows_identite.append(("SIRET sous-traitant", siret_sous_traitant_od, siret_sous_traitant_presta))
+
 lignes_html = []
 for label, v_od, v_pr in rows_identite:
     statut, detail = comparer(v_od, v_pr, tolerance=0)
@@ -1069,9 +1061,6 @@ if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisat
     st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
 if avertissement_installateur:
     st.warning(avertissement_installateur)
-avertissement_sous_traitance = detecter_sous_traitance(report, siret_odicee)
-if avertissement_sous_traitance:
-    st.info(avertissement_sous_traitance)
 
 for i, label in enumerate(df_identite_edite["Champ"]):
     valeur_orig = lignes_html[i][2]
@@ -1098,6 +1087,10 @@ for i, label in enumerate(df_identite_edite["Champ"]):
     elif label == "SIRET professionnel":
         titulaire["siret"] = valeur_editee
         modifications_odicee.append((fiche_odicee_match, "professionnelTitulaireSigneQualite.siret", valeur_orig, valeur_editee))
+    elif label == "SIRET sous-traitant":
+        st_dict = lot.setdefault("professionnelSousTraitant", {})
+        st_dict["siret"] = valeur_editee
+        modifications_odicee.append((fiche_odicee_match, "professionnelSousTraitant.siret", valeur_orig, valeur_editee))
 
 # ── Comparaison technique champ par champ ──
 st.markdown("#### 🔧 Données techniques")
