@@ -481,45 +481,80 @@ def get_presta_technical_value(report, doc_type, cle_presta):
     return None, None
 
 
-def trouver_professionnel_installateur(data, lot):
+def trouver_professionnel_installateur(data, lot, siret_cible=None):
     """Retrouve le professionnel qui a réellement réalisé les travaux (SIRET à comparer aux
     documents prestataire), PAS le maître d'œuvre ni un mandataire/apporteur d'affaire signataire
-    de la partie C — ces deux rôles se logent parfois dans lot.professionnel selon les dossiers.
+    de la partie C — ce rôle se loge tantôt dans lot.professionnel, tantôt dans
+    lot.professionnelTitulaireSigneQualite selon les dossiers (aucun des deux n'est fiable à
+    lui seul : sur certains dossiers professionnel=maître d'œuvre et Titulaire=installateur ;
+    sur d'autres c'est l'inverse, Titulaire pointant vers un sous-traitant RGE différent de
+    l'entreprise qui a facturé).
 
-    Ordre de résolution :
-    1. lot.professionnelTitulaireSigneQualite si renseigné (le plus fiable, rattaché au lot).
-    2. data.dossierProfessionnels : recherche d'entrées de type "INSTALLATEUR" — utilisée
-       UNIQUEMENT s'il n'y en a qu'une seule de façon certaine (SIRET unique). Un dossier
-       multi-lots peut avoir plusieurs installateurs différents sans champ reliant chacun à
-       son lot précis dans le JSON : dans ce cas on ne devine pas, on retombe sur lot.professionnel
-       avec un avertissement.
-    3. lot.professionnel en dernier recours (peut être le mandataire/maître d'œuvre — ambigu).
+    Stratégie : si le SIRET de la facture prestataire est connu, on cherche EN PRIORITÉ lequel
+    des candidats Odicee (professionnel du lot, professionnelTitulaireSigneQualite,
+    professionnelSousTraitant, dossierProfessionnels de type INSTALLATEUR) correspond réellement
+    à ce SIRET — c'est la seule façon de lever l'ambiguïté sans deviner. À défaut de
+    correspondance (ou si aucun SIRET cible n'est fourni), on retombe sur professionnelTitulaireSigneQualite
+    puis un unique dossierProfessionnels INSTALLATEUR, puis lot.professionnel en dernier recours,
+    avec un avertissement si le résultat reste incertain.
 
     Retourne (dict_professionnel, avertissement_ou_None)."""
+    prof = lot.get("professionnel") or {}
     titulaire = lot.get("professionnelTitulaireSigneQualite")
-    if isinstance(titulaire, dict) and titulaire.get("siret"):
-        return titulaire, None
+    titulaire = titulaire if isinstance(titulaire, dict) else {}
+    sous_traitant = lot.get("professionnelSousTraitant")
+    sous_traitant = sous_traitant if isinstance(sous_traitant, dict) else {}
 
-    installateurs = []
+    installateurs_dossier = []
     sirets_vus = set()
     for dp in data.get("dossierProfessionnels", []) or []:
         if dp.get("type") == "INSTALLATEUR":
             p = dp.get("professionnel") or {}
             if p.get("siret") and p["siret"] not in sirets_vus:
                 sirets_vus.add(p["siret"])
-                installateurs.append(p)
-    if len(installateurs) == 1:
-        return installateurs[0], None
+                installateurs_dossier.append(p)
 
-    prof = lot.get("professionnel") or {}
-    if len(installateurs) > 1:
+    candidats = [prof, titulaire, sous_traitant] + installateurs_dossier
+
+    if siret_cible:
+        for c in candidats:
+            if c.get("siret") == siret_cible:
+                return c, None
+
+    if titulaire.get("siret"):
+        return titulaire, None
+    if len(installateurs_dossier) == 1:
+        return installateurs_dossier[0], None
+    if len(installateurs_dossier) > 1:
         return prof, (
-            f"⚠️ {len(installateurs)} installateurs différents identifiés au niveau du dossier "
-            "(dossierProfessionnels), sans rattachement fiable à ce lot précis dans le JSON — "
-            "le SIRET affiché (professionnel du lot) peut être un mandataire/maître d'œuvre plutôt "
-            "que l'installateur réel. À vérifier manuellement."
+            f"⚠️ {len(installateurs_dossier)} installateurs différents identifiés au niveau du "
+            "dossier, aucun ne correspondant au SIRET de la facture — le SIRET affiché "
+            "(professionnel du lot) est incertain. À vérifier manuellement."
         )
     return prof, None
+
+
+def detecter_sous_traitance(report, siret_titulaire):
+    """Signale une sous-traitance potentielle : présence d'une déclaration de sous-traitance
+    (DC4) et/ou d'un certificat RGE au nom d'une entreprise différente du titulaire ayant
+    facturé. Le SIRET facture reste celui de l'émetteur de la facture (le titulaire) — c'est
+    normal et pas une erreur d'extraction — mais le SIRET RGE réellement mobilisé pour la
+    fiche technique peut être celui du sous-traitant : à vérifier manuellement dans ce cas.
+    Retourne un message d'info ou None."""
+    a_dc4 = any(d.get("type") == "SubcontractingDeclaration" for d in report.get("documents", []) or [])
+    doc_rge = get_presta_doc(report, "RgeCertificate")
+    siret_rge = (doc_rge or {}).get("extractedFields", {}).get("siret")
+    societe_rge = (doc_rge or {}).get("extractedFields", {}).get("companyName")
+
+    if a_dc4 and siret_rge and siret_titulaire and siret_rge != siret_titulaire:
+        return (
+            f"ℹ️ Sous-traitance détectée (déclaration DC4 présente) : le SIRET facture "
+            f"correspond au titulaire qui a émis la facture, mais le certificat RGE mobilisé "
+            f"pour cette fiche est au nom d'une autre entreprise (**{societe_rge or '—'}**, "
+            f"SIRET {siret_rge}) — probablement le sous-traitant réel. Ce n'est pas une erreur "
+            "du prestataire, juste une nuance à garder en tête pour le contrôle."
+        )
+    return None
 
 
 def caster_comme_original(valeur_originale, nouvelle_valeur_texte):
@@ -622,7 +657,7 @@ def valeurs_presta_document(doc_presta):
     return [(l, v) for l, v in valeurs if len(str(v).strip()) >= 3]
 
 
-def valeurs_odicee_dossier_pdf(fd, lot, data):
+def valeurs_odicee_dossier_pdf(fd, lot, data, report=None):
     """Valeurs Odicee repérables sur un PDF : champs techniques du lot (formData) + identité
     du professionnel. Pas de notion de document associé côté Odicee — cherché sur tous les PDF."""
     valeurs = []
@@ -636,7 +671,11 @@ def valeurs_odicee_dossier_pdf(fd, lot, data):
             continue
         if val not in (None, "") and not isinstance(val, (dict, list, bool)):
             valeurs.append((cle, val))
-    titulaire, _avertissement = trouver_professionnel_installateur(data, lot)
+    siret_facture = None
+    if report:
+        doc_fact = get_presta_doc(report, "Invoice")
+        siret_facture = (doc_fact or {}).get("extractedFields", {}).get("siret")
+    titulaire, _avertissement = trouver_professionnel_installateur(data, lot, siret_facture)
     if titulaire.get("siret"):
         valeurs.append(("SIRET professionnel", titulaire["siret"]))
     if titulaire.get("raisonSociale"):
@@ -993,10 +1032,11 @@ rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
 # `professionnel` est tantôt le maître d'œuvre, tantôt un mandataire/apporteur d'affaire — jamais
 # fiable à l'aveugle. Le SIRET à comparer aux documents prestataire (facture/RGE) est celui du
-# professionnel RGE ayant réalisé les travaux : voir trouver_professionnel_installateur().
-titulaire, avertissement_installateur = trouver_professionnel_installateur(data, lot)
-siret_odicee = titulaire.get("siret")
+# professionnel ayant réellement réalisé les travaux : voir trouver_professionnel_installateur(),
+# qui confronte chaque candidat Odicee au SIRET de la facture pour lever l'ambiguïté.
 siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
+titulaire, avertissement_installateur = trouver_professionnel_installateur(data, lot, siret_presta)
+siret_odicee = titulaire.get("siret")
 rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
 
 lignes_html = []
@@ -1029,6 +1069,9 @@ if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisat
     st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
 if avertissement_installateur:
     st.warning(avertissement_installateur)
+avertissement_sous_traitance = detecter_sous_traitance(report, siret_odicee)
+if avertissement_sous_traitance:
+    st.info(avertissement_sous_traitance)
 
 for i, label in enumerate(df_identite_edite["Champ"]):
     valeur_orig = lignes_html[i][2]
@@ -1434,7 +1477,7 @@ if fichier_zip_surlignage:
         if not documents_surlignables:
             st.warning("Aucun document surlignable dans ce rapport (l'attestation sur l'honneur est exclue).")
         else:
-            valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot, data)
+            valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot, data, report)
 
             noms_docs_pdf = [d.get("fileName") for d in documents_surlignables if d.get("fileName")]
             doc_choisi_nom_pdf = st.selectbox("Document à surligner :", noms_docs_pdf, key="doc_surlignage")
