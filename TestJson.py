@@ -155,13 +155,21 @@ def _parse_table_values(champ_table):
 
 def comparer_th106(fd, report):
     """BAR-TH-106 : deux structures Odicee possibles.
-    - type_logement == 1 (individuel) : colonnes directes (marque_chaudiere, etc.)
+    - type_logement == 1 (individuel) : colonnes directes. Marque et référence sont deux clés
+      Odicee SÉPARÉES (marque_chaudiere / reference_chaudiere, marque_regulateur /
+      reference_regulateur) — chacune comparée à son équivalent prestataire (boilerBrand /
+      boilerReference, regulatorBrand / regulatorReference).
     - type_logement == 2 (collectif) : tableau 'Puissance', une ligne par type de chaudière
-      = [marque+référence fusionnées, quantité, puissance kW, ETAS %, marque régulateur, classe régulateur].
-    Retourne (lignes_comparaison, note) où note signale un cas à vérifier à la main (ex.
-    plusieurs lignes dans le tableau, ce que la comparaison automatique ne fait pas)."""
+      = [marque+référence FUSIONNÉES par Odicee lui-même, quantité, puissance kW, ETAS %,
+      marque+référence régulateur FUSIONNÉES, classe régulateur]. Pas de séparation possible
+      côté Odicee dans ce cas — comparé à la concaténation marque+référence du prestataire.
+    Retourne (lignes_comparaison, note, editable) où note signale un cas à vérifier à la main
+    (ex. plusieurs lignes dans le tableau, ce que la comparaison automatique ne fait pas)."""
     lignes_table = _parse_table_values(fd.get("Puissance"))
     note = None
+
+    def _fusionner(marque, reference):
+        return " ".join(filter(None, [str(marque or "").strip(), str(reference or "").strip()])).strip() or None
 
     if lignes_table:
         if len(lignes_table) > 1:
@@ -172,17 +180,21 @@ def comparer_th106(fd, report):
             )
         r0 = lignes_table[0]
         odicee_vals = {
-            "boiler": r0[0] if len(r0) > 0 else None,
+            "chaudiere_fusion": r0[0] if len(r0) > 0 else None,
             "quantite": r0[1] if len(r0) > 1 else None,
             "puissance_kw": r0[2] if len(r0) > 2 else None,
             "etas": r0[3] if len(r0) > 3 else None,
-            "regulateur": r0[4] if len(r0) > 4 else None,
+            "regulateur_fusion": r0[4] if len(r0) > 4 else None,
             "classe": ROMAIN_VERS_ARABE.get(r0[5], r0[5]) if len(r0) > 5 else None,
         }
+        champs = [
+            ("Marque/référence chaudière", "chaudiere_fusion", "boilerBrand+boilerReference", None),
+            ("Quantité chaudières", "quantite", "quantity", "nb_equipements"),
+            ("ETAS (%)", "etas", "etasPercent", "efficacite_energetique"),
+            ("Marque/référence régulateur", "regulateur_fusion", "regulatorBrand+regulatorReference", None),
+            ("Classe régulateur", "classe", "regulatorClass", None),
+        ]
     else:
-        marque = fd.get("marque_chaudiere")
-        reference = fd.get("reference_chaudiere")
-        boiler = " ".join(filter(None, [str(marque or ""), str(reference or "")])).strip() or None
         # nb_equipements n'est réellement renseigné par Odicee que lorsque le lot est en saisie
         # multiple (plusieurs chaudières identiques) ; sur un lot simple (1 logement,
         # is_multiple_entry=0) c'est une valeur par défaut (0) non significative.
@@ -191,16 +203,27 @@ def comparer_th106(fd, report):
         # Odicee individuel — jamais comparée ici pour éviter un faux écart trompeur.
         saisie_multiple = fd.get("is_multiple_entry") == 1
         odicee_vals = {
-            "boiler": boiler,
+            "marque_chaudiere": fd.get("marque_chaudiere"),
+            "reference_chaudiere": fd.get("reference_chaudiere"),
             "quantite": fd.get("nb_equipements") if saisie_multiple else None,
             "puissance_kw": None,
             "etas": fd.get("efficacite_energetique"),
-            "regulateur": fd.get("marque_regulateur"),
+            "marque_regulateur": fd.get("marque_regulateur"),
+            "reference_regulateur": fd.get("reference_regulateur"),
             "classe": ROMAIN_VERS_ARABE.get(
                 decoder_valeur("BAR-TH-106", "classe_regulateur", fd.get("classe_regulateur")),
                 fd.get("classe_regulateur"),
             ),
         }
+        champs = [
+            ("Marque chaudière", "marque_chaudiere", "boilerBrand", "marque_chaudiere"),
+            ("Référence chaudière", "reference_chaudiere", "boilerReference", "reference_chaudiere"),
+            ("Quantité chaudières", "quantite", "quantity", "nb_equipements"),
+            ("ETAS (%)", "etas", "etasPercent", "efficacite_energetique"),
+            ("Marque régulateur", "marque_regulateur", "regulatorBrand", "marque_regulateur"),
+            ("Référence régulateur", "reference_regulateur", "regulatorReference", "reference_regulateur"),
+            ("Classe régulateur", "classe", "regulatorClass", None),
+        ]
         if saisie_multiple:
             note = (
                 "ℹ️ Puissance non comparée : Odicee ne stocke ici qu'un seuil Oui/Non "
@@ -213,14 +236,6 @@ def comparer_th106(fd, report):
                 "stocke qu'un seuil Oui/Non (« ≤ 70 kW ? »), pas une valeur en kW."
             )
 
-    champs = [
-        ("Marque/référence chaudière", "boiler", "boilerBrand", None),
-        ("Quantité chaudières", "quantite", "quantity", "nb_equipements"),
-        ("Puissance nominale (kW)", "puissance_kw", "nominalPowerKw", "puissance_thermique_nominale"),
-        ("ETAS (%)", "etas", "etasPercent", "efficacite_energetique"),
-        ("Marque régulateur", "regulateur", "regulatorBrand", "marque_regulateur"),
-        ("Classe régulateur", "classe", "regulatorClass", None),
-    ]
     # Édition manuelle possible uniquement dans le cas "individuel" (colonnes directes) : le cas
     # "collectif" (tableau Puissance multi-lignes) n'est pas réinjectable simplement en JSON ici.
     editable = not lignes_table
@@ -230,7 +245,15 @@ def comparer_th106(fd, report):
         valeur_od = odicee_vals.get(cle_od)
         valeurs_pr = {}
         for dt in DOC_TYPES_TECHNIQUES:
-            v, _ = get_presta_technical_value(report, dt, cle_pr)
+            if "+" in cle_pr:
+                # Cas collectif : Odicee fusionne marque+référence, on fusionne pareillement les
+                # deux champs prestataire correspondants pour une comparaison équitable.
+                cle_pr_marque, cle_pr_ref = cle_pr.split("+")
+                v_marque, _ = get_presta_technical_value(report, dt, cle_pr_marque)
+                v_ref, _ = get_presta_technical_value(report, dt, cle_pr_ref)
+                v = _fusionner(v_marque, v_ref)
+            else:
+                v, _ = get_presta_technical_value(report, dt, cle_pr)
             valeurs_pr[dt] = v
         lignes.append((label, valeur_od, valeurs_pr, cle_ecriture if editable else None))
     return lignes, note, editable
