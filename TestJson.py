@@ -26,6 +26,7 @@ signalées comme telles dans l'UI.
 import streamlit as st
 import json
 import re
+import difflib
 import unicodedata
 from datetime import datetime
 import pytz
@@ -310,7 +311,11 @@ def normalise_texte(v):
         return ""
     s = str(v).strip().lower()
     s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"\s+", " ", s)
+    # Ponctuation courante (virgule, tiret, +, |, parenthèses...) traitée comme un espace : une
+    # adresse "109, rue X - 62800 Y" doit matcher "109 rue X 62800 Y", une référence "A + B"
+    # doit matcher "A | B" — ce ne sont que des variantes de mise en forme, pas des écarts réels.
+    s = re.sub(r"[,;:|+\-()/]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
@@ -388,6 +393,11 @@ def comparer(valeur_odicee, valeur_presta, tolerance=0.01):
         return "ok", None
     if t_od in t_pr or t_pr in t_od:
         return "indetermine", "Correspondance partielle — à vérifier visuellement"
+    # Tolérance sur les micro-écarts de mise en forme (espace manquant/en trop, caractère isolé
+    # différent) qui ne sont pas de vrais écarts de valeur, ex: "PRK 32" vs "PRK32".
+    ratio = difflib.SequenceMatcher(None, t_od, t_pr).ratio()
+    if ratio >= 0.90:
+        return "indetermine", f"Quasi identique ({ratio*100:.0f}% de similarité) — à vérifier visuellement"
     return "ecart", f"« {valeur_odicee} » ≠ « {valeur_presta} »"
 
 
