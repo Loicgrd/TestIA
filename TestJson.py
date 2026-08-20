@@ -443,7 +443,10 @@ def badge(statut):
 
 def get_odicee_lots_bar(data):
     """Reprend la même extraction que 3_Supervision_Dossier.py : tous les lots BAR
-    de tous les sites, regroupés par référence de fiche."""
+    de tous les sites, regroupés par référence de fiche. Le libellé de sélection intègre le
+    complément d'adresse du lot (ex: "BAT A-B-C-D") quand il existe, pour distinguer deux lots
+    de la même fiche situés à la même adresse de site (cas fréquent : un même complexe
+    immobilier découpé en plusieurs bâtiments, chacun son propre lot de travaux)."""
     lots_par_fiche = {}
     for site in data.get("sites", []) or []:
         num_site = site.get("numero", "")
@@ -456,7 +459,9 @@ def get_odicee_lots_bar(data):
             ref = str(fd.get("reference", "")).upper()
             if "BAR" not in ref:
                 continue
-            lots_par_fiche.setdefault(fd.get("reference", ""), []).append((lot, adresse_site))
+            complement = fd.get("complement_adresse")
+            libelle = f"{adresse_site} — {complement}" if complement else adresse_site
+            lots_par_fiche.setdefault(fd.get("reference", ""), []).append((lot, libelle))
     return lots_par_fiche
 
 
