@@ -58,6 +58,20 @@ except ImportError:
     SUPABASE_DISPONIBLE = False
 
 
+def normaliser_numero_dossier(brut):
+    """Normalise un numéro de dossier vers une clé canonique — uniquement les chiffres, sans
+    préfixe — quel que soit son format d'origine (avec/sans "T", "CP", "CPC"..., suffixe de
+    version "V2", espaces...). On ne garde volontairement PAS le préfixe : il varie selon le
+    type de dossier (T, CP, CPC...) et le prestataire l'omet parfois complètement — tenter de
+    le deviner ou le forcer produirait de fausses correspondances. Les chiffres seuls suffisent
+    à relier de façon fiable un dossier Odicee à son analyse Prestataire dans Supabase."""
+    if not brut:
+        return brut
+    premier_mot = str(brut).strip().split(" ")[0]  # ignore un éventuel suffixe "V2" etc.
+    chiffres = re.sub(r"\D", "", premier_mot)
+    return chiffres if chiffres else premier_mot
+
+
 @st.cache_resource
 def get_supabase_client():
     """Connexion Supabase (persistance des JSON Odicee entre sessions). Retourne None si les
@@ -83,7 +97,7 @@ def sauvegarder_dossier_odicee(data, fiche=None):
     client = get_supabase_client()
     if not client:
         return False, "Supabase non configuré (secrets absents/invalides ou package non installé)."
-    numero = f"{data.get('prefixe', '') or ''}{data.get('id', '')}"
+    numero = normaliser_numero_dossier(f"{data.get('prefixe', '') or ''}{data.get('id', '')}")
     if not numero:
         return False, "Impossible de déterminer le numéro de dossier (champs 'id'/'prefixe' absents du JSON)."
     try:
@@ -1270,10 +1284,10 @@ report = presta.get("report") or {}
 documents_presta = report.get("documents", []) or []
 fiche_presta = str(report.get("barReference", "")).upper()
 filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
-# Certaines analyses portent un suffixe de version dans le fileNumber lui-même (ex: "T155418 V2")
-# — on ne garde que le premier token pour la clé d'enregistrement Supabase, afin que toutes les
-# analyses d'un même dossier se regroupent dans le même historique, quel que soit le suffixe.
-numero_dossier_presta = filenumber_presta.split(" ")[0] if filenumber_presta else filenumber_presta
+# Le prestataire n'inclut pas toujours le préfixe "T" (ex: "176444" au lieu de "T176444") et
+# ajoute parfois un suffixe de version (ex: "T155418 V2") — normalisation vers la même clé
+# canonique que côté Odicee, pour que les deux se retrouvent dans le même historique.
+numero_dossier_presta = normaliser_numero_dossier(filenumber_presta)
 
 if fichier_presta and filenumber_presta:
     # Historique conservé (insert), sauf si rigoureusement identique à la dernière version
