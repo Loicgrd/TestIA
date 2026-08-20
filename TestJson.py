@@ -460,11 +460,24 @@ def get_odicee_lots_bar(data):
     return lots_par_fiche
 
 
-# Certains dossiers utilisent un type de document alternatif pour la facture (ex: "CeeInvoice"
-# au lieu de "Invoice") — parfois même en présence des deux, l'un des deux étant vide côté
-# extraction. On essaie chaque type candidat dans l'ordre et on garde la première valeur non
-# vide trouvée, plutôt que de s'arrêter sur un premier document dont l'extraction a échoué.
-TYPES_ALTERNATIFS = {"Invoice": ["Invoice", "CeeInvoice"]}
+# Certains dossiers utilisent un type de document alternatif pour la preuve de réalisation
+# (ex: "CeeInvoice" au lieu de "Invoice", ou "FinalSettlement" — décompte général définitif —
+# sur les marchés publics qui ne produisent pas de facture classique) — parfois même en
+# présence de plusieurs, l'un étant vide côté extraction. On essaie chaque type candidat dans
+# l'ordre et on garde la première valeur non vide trouvée, plutôt que de s'arrêter sur un
+# premier document dont l'extraction a échoué.
+TYPES_ALTERNATIFS = {"Invoice": ["Invoice", "CeeInvoice", "FinalSettlement"]}
+
+
+def get_presta_doc_alias(report, doc_type):
+    """Comme get_presta_doc, mais tient compte des types de document alternatifs
+    (TYPES_ALTERNATIFS) — pour savoir si "une facture (ou équivalent)" existe dans le dossier,
+    peu importe son type exact côté prestataire."""
+    for dt in TYPES_ALTERNATIFS.get(doc_type, [doc_type]):
+        doc = get_presta_doc(report, dt)
+        if doc:
+            return doc
+    return None
 
 
 def get_presta_technical_value(report, doc_type, cle_presta):
@@ -985,7 +998,7 @@ doc_engagement = (
 )
 doc_realisation = (
     get_presta_doc_par_regle(report, "DOSSIER_HAS_COMPLETION")
-    or get_presta_doc(report, "Invoice")
+    or get_presta_doc_alias(report, "Invoice")
 )
 
 rows_identite = []
@@ -1102,7 +1115,7 @@ if "BAR-TH-106" in ref_upper:
     lignes_th106, note_th106, editable_th106 = comparer_th106(fd, report)
     if note_th106:
         st.info(note_th106)
-    docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc(report, dt)]
+    docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc_alias(report, dt)]
     entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
     lignes = {c: [] for c in entete}
     cles_ecriture_th106 = []
@@ -1239,7 +1252,7 @@ else:
     elif not regles_fiche:
         st.warning(f"Fiche **{fiche_odicee_match}** absente de REGLES (utils_supervision.py).")
     else:
-        docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc(report, dt)]
+        docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc_alias(report, dt)]
         if not docs_presents:
             st.warning("Aucun document AH/Facture exploitable dans le JSON prestataire.")
         else:
