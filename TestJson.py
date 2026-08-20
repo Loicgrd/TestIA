@@ -131,10 +131,11 @@ def charger_dossier_odicee(numero_dossier):
 
 
 def sauvegarder_analyse_prestataire(presta, numero_dossier, fiche):
-    """Ajoute (n'écrase jamais) un enregistrement d'historique pour cette analyse prestataire —
-    contrairement à l'Odicee, on garde toutes les versions pour pouvoir comparer l'évolution
-    dans le temps (ex : le prestataire s'améliore-t-il après une correction signalée ?).
-    Retourne (succès, message)."""
+    """Ajoute un enregistrement d'historique pour cette analyse prestataire — contrairement à
+    l'Odicee, on garde toutes les versions pour pouvoir comparer l'évolution dans le temps
+    (ex : le prestataire s'améliore-t-il après une correction signalée ?). Si la dernière
+    version enregistrée est rigoureusement identique, on ne crée pas de doublon.
+    Retourne (succès, message) — message vaut "identique" si rien n'a été réenregistré."""
     client = get_supabase_client()
     if not client:
         return False, "Supabase non configuré (secrets absents/invalides ou package non installé)."
@@ -142,6 +143,16 @@ def sauvegarder_analyse_prestataire(presta, numero_dossier, fiche):
         return False, "Numéro de dossier prestataire introuvable (champ 'fileNumber' absent du JSON)."
     report = presta.get("report") or {}
     try:
+        dernier = (
+            client.table("dossiers_prestataire")
+            .select("donnees")
+            .eq("numero_dossier", numero_dossier)
+            .order("date_ajout", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if dernier.data and dernier.data[0]["donnees"] == presta:
+            return True, "identique"
         client.table("dossiers_prestataire").insert({
             "numero_dossier": numero_dossier,
             "fiche": fiche,
@@ -172,6 +183,50 @@ def lister_historique_prestataire(numero_dossier):
         return res.data or []
     except Exception:
         return []
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def lister_toutes_analyses_prestataire():
+    """Toutes les analyses prestataire enregistrées, tous dossiers confondus, les plus
+    récentes en premier — pour le sélecteur de rechargement en haut de page."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        res = (
+            client.table("dossiers_prestataire")
+            .select("id, numero_dossier, fiche, reliability_score, overall_status, date_analyse, date_ajout")
+            .order("date_ajout", desc=True)
+            .limit(200)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def supprimer_dossier_odicee(numero_dossier):
+    """Supprime un dossier Odicee enregistré. Retourne (succès, message)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase non configuré."
+    try:
+        client.table("dossiers_odicee").delete().eq("numero_dossier", numero_dossier).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def supprimer_analyse_prestataire(id_analyse):
+    """Supprime une version d'analyse prestataire enregistrée. Retourne (succès, message)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase non configuré."
+    try:
+        client.table("dossiers_prestataire").delete().eq("id", id_analyse).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 def charger_analyse_prestataire(id_analyse):
@@ -1069,29 +1124,77 @@ if id_presta_sidebar:
         "chargé ci-dessous, le lien correspondant s'affiche automatiquement."
     )
 
+supabase_ok = SUPABASE_DISPONIBLE and get_supabase_client()
+
+if supabase_ok:
+    st.markdown("### 📂 Dossiers déjà enregistrés")
+    col_g1, col_g2 = st.columns(2)
+
+    with col_g1:
+        st.markdown("**Odicee** *(1 version conservée par dossier)*")
+        dossiers_enregistres = lister_dossiers_odicee()
+        if not dossiers_enregistres:
+            st.caption("Aucun dossier enregistré pour l'instant.")
+        for d in dossiers_enregistres:
+            c1, c2, c3 = st.columns([6, 2, 1])
+            c1.write(f"{d['numero_dossier']} ({d.get('fiche') or '?'}) — {d['date_maj'][:10]}")
+            if c2.button("Charger", key=f"charger_od_{d['numero_dossier']}"):
+                donnees, err = charger_dossier_odicee(d["numero_dossier"])
+                st.session_state["_odicee_recharge"] = donnees
+                if err:
+                    st.error(f"⚠️ Échec du rechargement : {err}")
+                else:
+                    st.rerun()
+            if c3.button("🗑️", key=f"suppr_od_{d['numero_dossier']}"):
+                ok, err = supprimer_dossier_odicee(d["numero_dossier"])
+                if ok:
+                    lister_dossiers_odicee.clear()
+                    st.session_state.pop("_odicee_recharge", None)
+                    st.rerun()
+                else:
+                    st.error(f"⚠️ Échec de la suppression : {err}")
+
+    with col_g2:
+        st.markdown("**Prestataire** *(historique complet conservé)*")
+        analyses_enregistrees = lister_toutes_analyses_prestataire()
+        if not analyses_enregistrees:
+            st.caption("Aucune analyse enregistrée pour l'instant.")
+        for a in analyses_enregistrees:
+            date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
+            fiab_aff = f" · {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
+            c1, c2, c3 = st.columns([6, 2, 1])
+            c1.write(f"{a['numero_dossier']} ({a.get('fiche') or '?'}) — {date_aff}{fiab_aff}")
+            if c2.button("Charger", key=f"charger_pr_{a['id']}"):
+                donnees, err = charger_analyse_prestataire(a["id"])
+                st.session_state["_presta_recharge"] = donnees
+                if err:
+                    st.error(f"⚠️ Échec du rechargement : {err}")
+                else:
+                    st.rerun()
+            if c3.button("🗑️", key=f"suppr_pr_{a['id']}"):
+                ok, err = supprimer_analyse_prestataire(a["id"])
+                if ok:
+                    lister_toutes_analyses_prestataire.clear()
+                    st.session_state.pop("_presta_recharge", None)
+                    st.rerun()
+                else:
+                    st.error(f"⚠️ Échec de la suppression : {err}")
+
+    st.markdown("---")
+
 col_up1, col_up2 = st.columns(2)
 with col_up1:
     fichier_odicee = st.file_uploader("JSON Odicee (dossier)", type="json", key="odicee")
-    if SUPABASE_DISPONIBLE and get_supabase_client():
-        dossiers_enregistres = lister_dossiers_odicee()
-        if dossiers_enregistres and not fichier_odicee:
-            options = ["—"] + [
-                f"{d['numero_dossier']} ({d.get('fiche') or '?'}) — {d['date_maj'][:10]}"
-                for d in dossiers_enregistres
-            ]
-            choix_dossier = st.selectbox("…ou recharger un dossier déjà enregistré", options)
-            if choix_dossier != "—":
-                numero_choisi = choix_dossier.split(" ")[0]
-                donnees_rechargees, erreur_rechargement = charger_dossier_odicee(numero_choisi)
-                st.session_state["_odicee_recharge"] = donnees_rechargees
-                if erreur_rechargement:
-                    st.error(f"⚠️ Échec du rechargement de {numero_choisi} : {erreur_rechargement}")
 with col_up2:
     fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
 
 data_rechargee = st.session_state.get("_odicee_recharge")
-if not (fichier_odicee or data_rechargee) or not fichier_presta:
-    st.info("Chargez le JSON Odicee (ou sélectionnez un dossier déjà enregistré) et le JSON prestataire pour lancer la comparaison.")
+presta_rechargee = st.session_state.get("_presta_recharge")
+if not (fichier_odicee or data_rechargee) or not (fichier_presta or presta_rechargee):
+    st.info(
+        "Chargez le JSON Odicee et le JSON prestataire (ou sélectionnez-les ci-dessus depuis "
+        "les dossiers déjà enregistrés) pour lancer la comparaison."
+    )
     st.stop()
 
 if fichier_odicee:
@@ -1103,11 +1206,14 @@ if fichier_odicee:
 else:
     data = data_rechargee
 
-try:
-    presta = json.load(fichier_presta)
-except Exception as e:
-    st.error(f"JSON Prestataire invalide : {e}")
-    st.stop()
+if fichier_presta:
+    try:
+        presta = json.load(fichier_presta)
+    except Exception as e:
+        st.error(f"JSON Prestataire invalide : {e}")
+        st.stop()
+else:
+    presta = presta_rechargee
 
 report = presta.get("report") or {}
 documents_presta = report.get("documents", []) or []
@@ -1115,11 +1221,15 @@ fiche_presta = str(report.get("barReference", "")).upper()
 filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
 
 if fichier_presta and filenumber_presta:
-    # Historique conservé (insert, jamais d'écrasement) — contrairement à l'Odicee, chaque
-    # nouvelle analyse prestataire est une version distincte, utile à comparer dans le temps.
+    # Historique conservé (insert), sauf si rigoureusement identique à la dernière version
+    # enregistrée (évite les doublons quand on redépose le même fichier par erreur).
     ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, filenumber_presta, fiche_presta)
-    if ok_presta:
+    if ok_presta and msg_presta == "identique":
+        st.toast(f"ℹ️ Identique à la dernière version enregistrée pour {filenumber_presta} — pas de doublon créé.", icon="ℹ️")
+        lister_toutes_analyses_prestataire.clear()
+    elif ok_presta:
         st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
+        lister_toutes_analyses_prestataire.clear()
     else:
         st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
 
@@ -1204,6 +1314,7 @@ if fichier_odicee and lots_par_fiche:
     ok_odicee, msg_odicee = sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
     if ok_odicee:
         st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
+        lister_dossiers_odicee.clear()
     else:
         st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
 
