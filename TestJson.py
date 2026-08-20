@@ -229,6 +229,7 @@ def supprimer_analyse_prestataire(id_analyse):
         return False, str(e)
 
 
+@st.cache_data(ttl=30, show_spinner=False)
 def lister_tous_numeros_connus():
     """Union des numéros de dossier connus côté Odicee et côté Prestataire, pour la recherche
     unifiée en haut de page."""
@@ -1150,79 +1151,87 @@ data_rechargee = None
 presta_rechargee = None
 
 if supabase_ok:
-    st.markdown("### 🔍 Retrouver un dossier déjà travaillé")
+    try:
+        st.markdown("### 🔍 Retrouver un dossier déjà travaillé")
 
-    def _libelle_version(a):
-        date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
-        fiab_aff = f" · fiabilité {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
-        return f"{date_aff}{fiab_aff}"
+        def _libelle_version(a):
+            date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
+            fiab_aff = f" · fiabilité {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
+            return f"{date_aff}{fiab_aff}"
 
-    numeros_connus = lister_tous_numeros_connus()
-    numero_recherche = st.selectbox(
-        "Numéro de dossier — tapez pour rechercher",
-        ["—"] + numeros_connus,
-        key="recherche_numero_unifiee",
-    )
+        numeros_connus = lister_tous_numeros_connus()
+        numero_recherche = st.selectbox(
+            "Numéro de dossier — tapez pour rechercher",
+            ["—"] + numeros_connus,
+            key="recherche_numero_unifiee",
+        )
 
-    if numero_recherche != "—":
-        col_r1, col_r2 = st.columns(2)
+        if numero_recherche != "—":
+            col_r1, col_r2 = st.columns(2)
 
-        # ── Odicee : unique, chargement automatique ──
-        with col_r1:
-            data_auto, err_od = charger_dossier_odicee(numero_recherche)
-            if err_od:
-                st.warning(f"Odicee : {err_od}")
-            elif data_auto:
-                data_rechargee = data_auto
-                c1, c2 = st.columns([5, 1])
-                c1.caption(f"✅ Odicee {numero_recherche} chargé automatiquement.")
-                if c2.button("🗑️", key="suppr_od_unifie", help="Supprimer ce dossier Odicee"):
-                    ok, err = supprimer_dossier_odicee(numero_recherche)
-                    if ok:
-                        lister_dossiers_odicee.clear()
-                        lister_tous_numeros_connus.clear()
-                        st.rerun()
-                    else:
-                        st.error(f"⚠️ {err}")
-            else:
-                st.caption("Aucun JSON Odicee enregistré pour ce dossier — déposez-le ci-dessous.")
-
-        # ── Prestataire : dernière version par défaut, sélecteur si historique ──
-        with col_r2:
-            historique = lister_historique_prestataire(numero_recherche)
-            if historique:
-                version_choisie = historique[0]
-                if len(historique) > 1:
-                    options_versions = [f"Dernière — {_libelle_version(historique[0])}"] + [
-                        f"Antérieure — {_libelle_version(v)}" for v in historique[1:]
-                    ]
-                    choix_version = st.selectbox(
-                        f"{len(historique)} versions prestataire", options_versions, key="version_pr_unifiee"
-                    )
-                    version_choisie = historique[options_versions.index(choix_version)]
-                presta_auto, err_pr = charger_analyse_prestataire(version_choisie["id"])
-                if err_pr:
-                    st.warning(f"Prestataire : {err_pr}")
-                elif presta_auto:
-                    presta_rechargee = presta_auto
+            # ── Odicee : unique, chargement automatique ──
+            with col_r1:
+                data_auto, err_od = charger_dossier_odicee(numero_recherche)
+                if err_od:
+                    st.warning(f"Odicee : {err_od}")
+                elif data_auto:
+                    data_rechargee = data_auto
                     c1, c2 = st.columns([5, 1])
-                    c1.caption(f"✅ Prestataire chargé ({_libelle_version(version_choisie)}).")
-                    if c2.button("🗑️", key="suppr_pr_unifie", help="Supprimer cette version prestataire"):
-                        ok, err = supprimer_analyse_prestataire(version_choisie["id"])
+                    c1.caption(f"✅ Odicee {numero_recherche} chargé automatiquement.")
+                    if c2.button("🗑️", key="suppr_od_unifie", help="Supprimer ce dossier Odicee"):
+                        ok, err = supprimer_dossier_odicee(numero_recherche)
                         if ok:
-                            lister_toutes_analyses_prestataire.clear()
+                            lister_dossiers_odicee.clear()
                             lister_tous_numeros_connus.clear()
                             st.rerun()
                         else:
                             st.error(f"⚠️ {err}")
-            else:
-                st.caption("Aucune analyse prestataire enregistrée pour ce dossier — déposez-la ci-dessous.")
+                else:
+                    st.caption("Aucun JSON Odicee enregistré pour ce dossier — déposez-le ci-dessous.")
 
-        st.caption(
-            "Pour retester ce dossier : le comparatif ci-dessus reflète la dernière analyse "
-            "connue — déposez juste le **nouveau** JSON prestataire ci-dessous, il remplace "
-            "automatiquement la version chargée pour cette comparaison (et s'ajoute à l'historique)."
+            # ── Prestataire : dernière version par défaut, sélecteur si historique ──
+            with col_r2:
+                historique = lister_historique_prestataire(numero_recherche)
+                if historique:
+                    version_choisie = historique[0]
+                    if len(historique) > 1:
+                        options_versions = [f"Dernière — {_libelle_version(historique[0])}"] + [
+                            f"Antérieure — {_libelle_version(v)}" for v in historique[1:]
+                        ]
+                        choix_version = st.selectbox(
+                            f"{len(historique)} versions prestataire", options_versions, key="version_pr_unifiee"
+                        )
+                        version_choisie = historique[options_versions.index(choix_version)]
+                    presta_auto, err_pr = charger_analyse_prestataire(version_choisie["id"])
+                    if err_pr:
+                        st.warning(f"Prestataire : {err_pr}")
+                    elif presta_auto:
+                        presta_rechargee = presta_auto
+                        c1, c2 = st.columns([5, 1])
+                        c1.caption(f"✅ Prestataire chargé ({_libelle_version(version_choisie)}).")
+                        if c2.button("🗑️", key="suppr_pr_unifie", help="Supprimer cette version prestataire"):
+                            ok, err = supprimer_analyse_prestataire(version_choisie["id"])
+                            if ok:
+                                lister_toutes_analyses_prestataire.clear()
+                                lister_tous_numeros_connus.clear()
+                                lister_historique_prestataire.clear()
+                                st.rerun()
+                            else:
+                                st.error(f"⚠️ {err}")
+                else:
+                    st.caption("Aucune analyse prestataire enregistrée pour ce dossier — déposez-la ci-dessous.")
+
+            st.caption(
+                "Pour retester ce dossier : le comparatif ci-dessus reflète la dernière analyse "
+                "connue — déposez juste le **nouveau** JSON prestataire ci-dessous, il remplace "
+                "automatiquement la version chargée pour cette comparaison (et s'ajoute à l'historique)."
+            )
+    except Exception as _e_recherche:
+        st.error(
+            f"⚠️ La recherche de dossiers enregistrés a rencontré un problème et a été "
+            f"désactivée pour cette page (l'upload manuel ci-dessous reste disponible) : {_e_recherche}"
         )
+        st.session_state.pop("recherche_numero_unifiee", None)
 
     st.markdown("---")
 
@@ -1272,6 +1281,8 @@ if fichier_presta and filenumber_presta:
     elif ok_presta:
         st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
         lister_toutes_analyses_prestataire.clear()
+        lister_historique_prestataire.clear()
+        lister_tous_numeros_connus.clear()
     else:
         st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
 
@@ -1357,6 +1368,7 @@ if fichier_odicee and lots_par_fiche:
     if ok_odicee:
         st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
         lister_dossiers_odicee.clear()
+        lister_tous_numeros_connus.clear()
     else:
         st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
 
