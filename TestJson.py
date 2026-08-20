@@ -49,7 +49,7 @@ except Exception:
     # Streamlit Cloud) — on désactive l'OCR plutôt que de planter l'app.
     OCR_DISPONIBLE = False
 
-from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104
+from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104, CHAMPS_CUMULABLES
 
 st.set_page_config(page_title="Comparateur Odicee / Prestataire", layout="wide")
 
@@ -1275,8 +1275,22 @@ else:
                 if cle_od not in mapping_fiche:
                     continue
                 cle_pr = mapping_fiche[cle_od]
-                valeur_od = fd.get(cle_od)
-                valeur_od_dec = decoder_valeur(fiche_odicee_match, cle_od, valeur_od)
+
+                # Champ cumulable (ex: surface) sur une fiche à plusieurs lots (plusieurs
+                # bâtiments d'un même complexe) : la facture prestataire donne souvent un total
+                # combiné plutôt qu'un chiffre par bâtiment — on doit alors sommer Odicee sur
+                # tous les lots de la fiche pour comparer des totaux équivalents, sinon chaque
+                # lot ressort systématiquement en faux écart net face au total facturé.
+                est_cumule = False
+                if cle_od in CHAMPS_CUMULABLES and len(lots_sites) > 1:
+                    valeurs_lots = [normalise_nombre(l.get("formData", {}).get(cle_od)) for l, _ in lots_sites]
+                    if all(v is not None for v in valeurs_lots):
+                        valeur_od = sum(valeurs_lots)
+                        valeur_od_dec = valeur_od
+                        est_cumule = True
+                if not est_cumule:
+                    valeur_od = fd.get(cle_od)
+                    valeur_od_dec = decoder_valeur(fiche_odicee_match, cle_od, valeur_od)
 
                 valeurs_pr = {}
                 for dt in docs_presents:
@@ -1289,7 +1303,10 @@ else:
                 statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
 
                 lignes[""].append(badge(statut_badge))
-                lignes["Champ"].append(f"{label}" + (f" ({unite})" if unite else ""))
+                lignes["Champ"].append(
+                    f"{label}" + (f" ({unite})" if unite else "")
+                    + (" [cumulé, tous lots]" if est_cumule else "")
+                )
                 lignes["Odicee"].append(
                     f"{valeur_od_dec}" if valeur_od_dec not in (None, "") else "—"
                 )
@@ -1298,7 +1315,9 @@ else:
                     lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
 
                 cles_od_lignes.append(cle_od)
-                encode_lignes.append(str(valeur_od_dec) != str(valeur_od))
+                # Un total cumulé ne se réinjecte pas proprement dans le formData d'un seul lot :
+                # non éditable, comme les champs encodés (même mécanisme de verrouillage).
+                encode_lignes.append(est_cumule or str(valeur_od_dec) != str(valeur_od))
 
             if lignes["Champ"]:
                 df_lignes = pd.DataFrame(lignes)
