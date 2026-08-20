@@ -51,6 +51,158 @@ except Exception:
 
 from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104, CHAMPS_CUMULABLES
 
+try:
+    from supabase import create_client
+    SUPABASE_DISPONIBLE = True
+except ImportError:
+    SUPABASE_DISPONIBLE = False
+
+
+@st.cache_resource
+def get_supabase_client():
+    """Connexion Supabase (persistance des JSON Odicee entre sessions). Retourne None si les
+    secrets ne sont pas configurés (SUPABASE_URL / SUPABASE_KEY) ou si le package n'est pas
+    installé — l'app continue de fonctionner sans persistance dans ce cas."""
+    if not SUPABASE_DISPONIBLE:
+        return None
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    except Exception:
+        return None
+    try:
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def sauvegarder_dossier_odicee(data, fiche=None):
+    """Enregistre (ou met à jour) le JSON Odicee dans Supabase, indexé par numéro de dossier.
+    Échoue silencieusement si Supabase n'est pas configuré — la persistance est un confort, pas
+    une dépendance bloquante pour utiliser l'app."""
+    client = get_supabase_client()
+    if not client:
+        return False
+    numero = f"{data.get('prefixe', '') or ''}{data.get('id', '')}"
+    if not numero:
+        return False
+    try:
+        client.table("dossiers_odicee").upsert({
+            "numero_dossier": numero,
+            "fiche": fiche,
+            "donnees": data,
+            "date_maj": datetime.now().isoformat(),
+        }).execute()
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def lister_dossiers_odicee():
+    """Liste (numéro, fiche, date de dernière sauvegarde) des dossiers déjà enregistrés,
+    triés du plus récent au plus ancien. Cache 60s pour éviter une requête à chaque interaction."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        res = (
+            client.table("dossiers_odicee")
+            .select("numero_dossier, fiche, date_maj")
+            .order("date_maj", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def charger_dossier_odicee(numero_dossier):
+    """Recharge le JSON complet d'un dossier précédemment enregistré."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        res = client.table("dossiers_odicee").select("donnees").eq("numero_dossier", numero_dossier).single().execute()
+        return res.data["donnees"] if res.data else None
+    except Exception:
+        return None
+
+
+def sauvegarder_analyse_prestataire(presta, numero_dossier, fiche):
+    """Ajoute (n'écrase jamais) un enregistrement d'historique pour cette analyse prestataire —
+    contrairement à l'Odicee, on garde toutes les versions pour pouvoir comparer l'évolution
+    dans le temps (ex : le prestataire s'améliore-t-il après une correction signalée ?)."""
+    client = get_supabase_client()
+    if not client or not numero_dossier:
+        return False
+    report = presta.get("report") or {}
+    try:
+        client.table("dossiers_prestataire").insert({
+            "numero_dossier": numero_dossier,
+            "fiche": fiche,
+            "reliability_score": report.get("reliabilityScore"),
+            "overall_status": report.get("overallStatus"),
+            "donnees": presta,
+            "date_analyse": presta.get("analyzedAt"),
+        }).execute()
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def lister_historique_prestataire(numero_dossier):
+    """Historique des analyses prestataire pour ce dossier, du plus récent au plus ancien."""
+    client = get_supabase_client()
+    if not client or not numero_dossier:
+        return []
+    try:
+        res = (
+            client.table("dossiers_prestataire")
+            .select("id, reliability_score, overall_status, date_analyse, date_ajout")
+            .eq("numero_dossier", numero_dossier)
+            .order("date_ajout", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def charger_analyse_prestataire(id_analyse):
+    """Recharge le JSON complet d'une analyse prestataire archivée, par son id."""
+    client = get_supabase_client()
+    if not client:
+        return None
+    try:
+        res = client.table("dossiers_prestataire").select("donnees").eq("id", id_analyse).single().execute()
+        return res.data["donnees"] if res.data else None
+    except Exception:
+        return None
+
+
+def comparer_deux_analyses_prestataire(ancien_presta, nouveau_presta):
+    """Compare les technicalFields des documents entre deux analyses prestataire du même
+    dossier (ex: avant/après correction), champ par champ. Retourne une liste de
+    (champ, valeur_ancienne, valeur_nouvelle, a_change)."""
+    def _aplatir(presta):
+        plat = {}
+        for doc in (presta.get("report") or {}).get("documents", []) or []:
+            tf = (doc.get("extractedFields") or {}).get("technicalFields") or {}
+            for cle, val in tf.items():
+                if val not in (None, ""):
+                    plat.setdefault(cle, val)  # première occurrence nom-champ toutes docs confondus
+        return plat
+
+    anc, nouv = _aplatir(ancien_presta), _aplatir(nouveau_presta)
+    tous_champs = sorted(set(anc) | set(nouv))
+    lignes = []
+    for champ in tous_champs:
+        v_anc, v_nouv = anc.get(champ), nouv.get(champ)
+        lignes.append((champ, v_anc if v_anc is not None else "—", v_nouv if v_nouv is not None else "—", v_anc != v_nouv))
+    return lignes
+
 st.set_page_config(page_title="Comparateur Odicee / Prestataire", layout="wide")
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
@@ -915,18 +1067,33 @@ if id_presta_sidebar:
 col_up1, col_up2 = st.columns(2)
 with col_up1:
     fichier_odicee = st.file_uploader("JSON Odicee (dossier)", type="json", key="odicee")
+    if SUPABASE_DISPONIBLE and get_supabase_client():
+        dossiers_enregistres = lister_dossiers_odicee()
+        if dossiers_enregistres and not fichier_odicee:
+            options = ["—"] + [
+                f"{d['numero_dossier']} ({d.get('fiche') or '?'}) — {d['date_maj'][:10]}"
+                for d in dossiers_enregistres
+            ]
+            choix_dossier = st.selectbox("…ou recharger un dossier déjà enregistré", options)
+            if choix_dossier != "—":
+                numero_choisi = choix_dossier.split(" ")[0]
+                st.session_state["_odicee_recharge"] = charger_dossier_odicee(numero_choisi)
 with col_up2:
     fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
 
-if not (fichier_odicee and fichier_presta):
-    st.info("Chargez les deux fichiers pour lancer la comparaison.")
+data_rechargee = st.session_state.get("_odicee_recharge")
+if not (fichier_odicee or data_rechargee) or not fichier_presta:
+    st.info("Chargez le JSON Odicee (ou sélectionnez un dossier déjà enregistré) et le JSON prestataire pour lancer la comparaison.")
     st.stop()
 
-try:
-    data = json.load(fichier_odicee)
-except Exception as e:
-    st.error(f"JSON Odicee invalide : {e}")
-    st.stop()
+if fichier_odicee:
+    try:
+        data = json.load(fichier_odicee)
+    except Exception as e:
+        st.error(f"JSON Odicee invalide : {e}")
+        st.stop()
+else:
+    data = data_rechargee
 
 try:
     presta = json.load(fichier_presta)
@@ -938,6 +1105,11 @@ report = presta.get("report") or {}
 documents_presta = report.get("documents", []) or []
 fiche_presta = str(report.get("barReference", "")).upper()
 filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
+
+if fichier_presta and filenumber_presta:
+    # Historique conservé (insert, jamais d'écrasement) — contrairement à l'Odicee, chaque
+    # nouvelle analyse prestataire est une version distincte, utile à comparer dans le temps.
+    sauvegarder_analyse_prestataire(presta, filenumber_presta, fiche_presta)
 
 # ── Vérification d'identité dossier ──
 st.markdown("### 🪪 Identification du dossier")
@@ -967,11 +1139,55 @@ if not match_id:
         "Vérifiez que vous comparez bien le même dossier avant d'interpréter les écarts ci-dessous."
     )
 
+# ── Historique des analyses prestataire pour ce dossier ──
+if SUPABASE_DISPONIBLE and get_supabase_client() and filenumber_presta:
+    historique = lister_historique_prestataire(filenumber_presta)
+    if len(historique) > 1:
+        with st.expander(f"🕓 Historique des analyses prestataire pour {filenumber_presta} ({len(historique)} versions)"):
+            df_hist = pd.DataFrame([
+                {
+                    "Date d'analyse": (h.get("date_analyse") or h.get("date_ajout") or "")[:19].replace("T", " "),
+                    "Fiabilité": f"{h['reliability_score']*100:.0f}%" if h.get("reliability_score") is not None else "—",
+                    "Statut global": h.get("overall_status") or "—",
+                }
+                for h in historique
+            ])
+            st.table(df_hist)
+
+            versions_labels = [
+                f"{(h.get('date_analyse') or h.get('date_ajout') or '')[:19].replace('T', ' ')} "
+                f"(fiabilité {h['reliability_score']*100:.0f}%)" if h.get("reliability_score") is not None
+                else (h.get("date_analyse") or h.get("date_ajout") or "")[:19].replace("T", " ")
+                for h in historique
+            ]
+            choix_ancien = st.selectbox(
+                "Comparer la version actuelle à une version antérieure :",
+                ["—"] + versions_labels[1:],  # la plus récente (index 0) = celle chargée maintenant
+            )
+            if choix_ancien != "—":
+                idx_choisi = versions_labels.index(choix_ancien)
+                ancien_presta = charger_analyse_prestataire(historique[idx_choisi]["id"])
+                if ancien_presta:
+                    diff = comparer_deux_analyses_prestataire(ancien_presta, presta)
+                    diff_changes = [d for d in diff if d[3]]
+                    if diff_changes:
+                        st.markdown(f"**{len(diff_changes)} champ(s) modifié(s) depuis cette version :**")
+                        st.table(pd.DataFrame(
+                            [{"Champ": c, "Ancienne valeur": va, "Nouvelle valeur": vn} for c, va, vn, _ in diff_changes]
+                        ))
+                    else:
+                        st.caption("Aucune différence détectée sur les champs techniques extraits entre ces deux versions.")
+
 st.markdown("---")
 
 # ── Sélection du lot Odicee correspondant à la fiche du rapport prestataire ──
 lots_par_fiche = get_odicee_lots_bar(data)
 fiche_odicee_match = next((f for f in lots_par_fiche if f.upper() == fiche_presta), None)
+
+if fichier_odicee and lots_par_fiche:
+    # Sauvegarde silencieuse dans Supabase à chaque nouvel upload (upsert : écrase la version
+    # précédente du même dossier). Sans effet si Supabase n'est pas configuré.
+    sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
 
 if not fiche_odicee_match:
     st.error(
