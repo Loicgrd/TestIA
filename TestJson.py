@@ -118,15 +118,16 @@ def lister_dossiers_odicee():
 
 
 def charger_dossier_odicee(numero_dossier):
-    """Recharge le JSON complet d'un dossier précédemment enregistré."""
+    """Recharge le JSON complet d'un dossier précédemment enregistré. Retourne (donnees, message
+    d'erreur ou None) pour pouvoir diagnostiquer un échec plutôt que de le masquer."""
     client = get_supabase_client()
     if not client:
-        return None
+        return None, "Supabase non configuré (secrets absents/invalides ou package non installé)."
     try:
         res = client.table("dossiers_odicee").select("donnees").eq("numero_dossier", numero_dossier).single().execute()
-        return res.data["donnees"] if res.data else None
-    except Exception:
-        return None
+        return (res.data["donnees"] if res.data else None), None
+    except Exception as e:
+        return None, str(e)
 
 
 def sauvegarder_analyse_prestataire(presta, numero_dossier, fiche):
@@ -174,15 +175,16 @@ def lister_historique_prestataire(numero_dossier):
 
 
 def charger_analyse_prestataire(id_analyse):
-    """Recharge le JSON complet d'une analyse prestataire archivée, par son id."""
+    """Recharge le JSON complet d'une analyse prestataire archivée, par son id. Retourne
+    (donnees, message d'erreur ou None)."""
     client = get_supabase_client()
     if not client:
-        return None
+        return None, "Supabase non configuré (secrets absents/invalides ou package non installé)."
     try:
         res = client.table("dossiers_prestataire").select("donnees").eq("id", id_analyse).single().execute()
-        return res.data["donnees"] if res.data else None
-    except Exception:
-        return None
+        return (res.data["donnees"] if res.data else None), None
+    except Exception as e:
+        return None, str(e)
 
 
 def comparer_deux_analyses_prestataire(ancien_presta, nouveau_presta):
@@ -1080,7 +1082,10 @@ with col_up1:
             choix_dossier = st.selectbox("…ou recharger un dossier déjà enregistré", options)
             if choix_dossier != "—":
                 numero_choisi = choix_dossier.split(" ")[0]
-                st.session_state["_odicee_recharge"] = charger_dossier_odicee(numero_choisi)
+                donnees_rechargees, erreur_rechargement = charger_dossier_odicee(numero_choisi)
+                st.session_state["_odicee_recharge"] = donnees_rechargees
+                if erreur_rechargement:
+                    st.error(f"⚠️ Échec du rechargement de {numero_choisi} : {erreur_rechargement}")
 with col_up2:
     fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
 
@@ -1113,11 +1118,10 @@ if fichier_presta and filenumber_presta:
     # Historique conservé (insert, jamais d'écrasement) — contrairement à l'Odicee, chaque
     # nouvelle analyse prestataire est une version distincte, utile à comparer dans le temps.
     ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, filenumber_presta, fiche_presta)
-    if SUPABASE_DISPONIBLE and get_supabase_client():
-        if ok_presta:
-            st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
-        else:
-            st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
+    if ok_presta:
+        st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
+    else:
+        st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
 
 # ── Vérification d'identité dossier ──
 st.markdown("### 🪪 Identification du dossier")
@@ -1174,8 +1178,10 @@ if SUPABASE_DISPONIBLE and get_supabase_client() and filenumber_presta:
             )
             if choix_ancien != "—":
                 idx_choisi = versions_labels.index(choix_ancien)
-                ancien_presta = charger_analyse_prestataire(historique[idx_choisi]["id"])
-                if ancien_presta:
+                ancien_presta, erreur_ancien = charger_analyse_prestataire(historique[idx_choisi]["id"])
+                if erreur_ancien:
+                    st.error(f"⚠️ Échec du rechargement de cette version : {erreur_ancien}")
+                elif ancien_presta:
                     diff = comparer_deux_analyses_prestataire(ancien_presta, presta)
                     diff_changes = [d for d in diff if d[3]]
                     if diff_changes:
@@ -1196,11 +1202,10 @@ if fichier_odicee and lots_par_fiche:
     # Sauvegarde dans Supabase à chaque nouvel upload (upsert : écrase la version précédente
     # du même dossier). Message explicite en cas d'échec pour pouvoir diagnostiquer.
     ok_odicee, msg_odicee = sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
-    if SUPABASE_DISPONIBLE and get_supabase_client():
-        if ok_odicee:
-            st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
-        else:
-            st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
+    if ok_odicee:
+        st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
+    else:
+        st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
 
 if not fiche_odicee_match:
     st.error(
