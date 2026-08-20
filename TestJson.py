@@ -1135,50 +1135,80 @@ if supabase_ok:
         dossiers_enregistres = lister_dossiers_odicee()
         if not dossiers_enregistres:
             st.caption("Aucun dossier enregistré pour l'instant.")
-        for d in dossiers_enregistres:
-            c1, c2, c3 = st.columns([6, 2, 1])
-            c1.write(f"{d['numero_dossier']} ({d.get('fiche') or '?'}) — {d['date_maj'][:10]}")
-            if c2.button("Charger", key=f"charger_od_{d['numero_dossier']}"):
-                donnees, err = charger_dossier_odicee(d["numero_dossier"])
-                st.session_state["_odicee_recharge"] = donnees
-                if err:
-                    st.error(f"⚠️ Échec du rechargement : {err}")
-                else:
-                    st.rerun()
-            if c3.button("🗑️", key=f"suppr_od_{d['numero_dossier']}"):
-                ok, err = supprimer_dossier_odicee(d["numero_dossier"])
-                if ok:
-                    lister_dossiers_odicee.clear()
-                    st.session_state.pop("_odicee_recharge", None)
-                    st.rerun()
-                else:
-                    st.error(f"⚠️ Échec de la suppression : {err}")
+        else:
+            options_od = ["—"] + [
+                f"{d['numero_dossier']} ({d.get('fiche') or '?'}) — {d['date_maj'][:10]}"
+                for d in dossiers_enregistres
+            ]
+            choix_od = st.selectbox("Rechercher un numéro de dossier", options_od, key="rech_od")
+            if choix_od != "—":
+                numero_od = choix_od.split(" ")[0]
+                cb1, cb2 = st.columns(2)
+                if cb1.button("📥 Charger", key="charger_od_btn", use_container_width=True):
+                    donnees, err = charger_dossier_odicee(numero_od)
+                    st.session_state["_odicee_recharge"] = donnees
+                    if err:
+                        st.error(f"⚠️ Échec du rechargement : {err}")
+                    else:
+                        st.rerun()
+                if cb2.button("🗑️ Supprimer", key="suppr_od_btn", use_container_width=True):
+                    ok, err = supprimer_dossier_odicee(numero_od)
+                    if ok:
+                        lister_dossiers_odicee.clear()
+                        st.session_state.pop("_odicee_recharge", None)
+                        st.rerun()
+                    else:
+                        st.error(f"⚠️ Échec de la suppression : {err}")
 
     with col_g2:
         st.markdown("**Prestataire** *(historique complet conservé)*")
         analyses_enregistrees = lister_toutes_analyses_prestataire()
         if not analyses_enregistrees:
             st.caption("Aucune analyse enregistrée pour l'instant.")
-        for a in analyses_enregistrees:
-            date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
-            fiab_aff = f" · {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
-            c1, c2, c3 = st.columns([6, 2, 1])
-            c1.write(f"{a['numero_dossier']} ({a.get('fiche') or '?'}) — {date_aff}{fiab_aff}")
-            if c2.button("Charger", key=f"charger_pr_{a['id']}"):
-                donnees, err = charger_analyse_prestataire(a["id"])
-                st.session_state["_presta_recharge"] = donnees
-                if err:
-                    st.error(f"⚠️ Échec du rechargement : {err}")
-                else:
-                    st.rerun()
-            if c3.button("🗑️", key=f"suppr_pr_{a['id']}"):
-                ok, err = supprimer_analyse_prestataire(a["id"])
-                if ok:
-                    lister_toutes_analyses_prestataire.clear()
-                    st.session_state.pop("_presta_recharge", None)
-                    st.rerun()
-                else:
-                    st.error(f"⚠️ Échec de la suppression : {err}")
+        else:
+            # Une entrée par dossier (la plus récente déjà en tête, la requête est triée desc)
+            versions_par_dossier = {}
+            for a in analyses_enregistrees:
+                versions_par_dossier.setdefault(a["numero_dossier"], []).append(a)
+
+            def _libelle(a):
+                date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
+                fiab_aff = f" · {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
+                return f"{date_aff}{fiab_aff}"
+
+            options_pr = ["—"] + [
+                f"{numero} ({versions[0].get('fiche') or '?'}) — dernière version : {_libelle(versions[0])}"
+                for numero, versions in versions_par_dossier.items()
+            ]
+            choix_pr = st.selectbox("Rechercher un numéro de dossier", options_pr, key="rech_pr")
+            if choix_pr != "—":
+                numero_pr = choix_pr.split(" ")[0]
+                versions = versions_par_dossier[numero_pr]
+                version_choisie = versions[0]
+                if len(versions) > 1:
+                    options_versions = [f"Dernière — {_libelle(versions[0])}"] + [
+                        f"Antérieure — {_libelle(v)}" for v in versions[1:]
+                    ]
+                    choix_version = st.selectbox(
+                        f"{len(versions)} versions disponibles pour {numero_pr}", options_versions, key="rech_pr_version"
+                    )
+                    version_choisie = versions[options_versions.index(choix_version)]
+                cb1, cb2 = st.columns(2)
+                if cb1.button("📥 Charger", key="charger_pr_btn", use_container_width=True):
+                    donnees, err = charger_analyse_prestataire(version_choisie["id"])
+                    st.session_state["_presta_recharge"] = donnees
+                    if err:
+                        st.error(f"⚠️ Échec du rechargement : {err}")
+                    else:
+                        st.rerun()
+                if cb2.button("🗑️ Supprimer cette version", key="suppr_pr_btn", use_container_width=True):
+                    ok, err = supprimer_analyse_prestataire(version_choisie["id"])
+                    if ok:
+                        lister_toutes_analyses_prestataire.clear()
+                        st.session_state.pop("_presta_recharge", None)
+                        st.rerun()
+                    else:
+                        st.error(f"⚠️ Échec de la suppression : {err}")
 
     st.markdown("---")
 
