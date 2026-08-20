@@ -1270,13 +1270,17 @@ report = presta.get("report") or {}
 documents_presta = report.get("documents", []) or []
 fiche_presta = str(report.get("barReference", "")).upper()
 filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
+# Certaines analyses portent un suffixe de version dans le fileNumber lui-même (ex: "T155418 V2")
+# — on ne garde que le premier token pour la clé d'enregistrement Supabase, afin que toutes les
+# analyses d'un même dossier se regroupent dans le même historique, quel que soit le suffixe.
+numero_dossier_presta = filenumber_presta.split(" ")[0] if filenumber_presta else filenumber_presta
 
 if fichier_presta and filenumber_presta:
     # Historique conservé (insert), sauf si rigoureusement identique à la dernière version
     # enregistrée (évite les doublons quand on redépose le même fichier par erreur).
-    ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, filenumber_presta, fiche_presta)
+    ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, numero_dossier_presta, fiche_presta)
     if ok_presta and msg_presta == "identique":
-        st.toast(f"ℹ️ Identique à la dernière version enregistrée pour {filenumber_presta} — pas de doublon créé.", icon="ℹ️")
+        st.toast(f"ℹ️ Identique à la dernière version enregistrée pour {numero_dossier_presta} — pas de doublon créé.", icon="ℹ️")
         lister_toutes_analyses_prestataire.clear()
     elif ok_presta:
         st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
