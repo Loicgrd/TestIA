@@ -229,6 +229,26 @@ def supprimer_analyse_prestataire(id_analyse):
         return False, str(e)
 
 
+def lister_tous_numeros_connus():
+    """Union des numéros de dossier connus côté Odicee et côté Prestataire, pour la recherche
+    unifiée en haut de page."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    numeros = set()
+    try:
+        res_od = client.table("dossiers_odicee").select("numero_dossier").execute()
+        numeros.update(r["numero_dossier"] for r in (res_od.data or []))
+    except Exception:
+        pass
+    try:
+        res_pr = client.table("dossiers_prestataire").select("numero_dossier").execute()
+        numeros.update(r["numero_dossier"] for r in (res_pr.data or []))
+    except Exception:
+        pass
+    return sorted(numeros)
+
+
 def charger_analyse_prestataire(id_analyse):
     """Recharge le JSON complet d'une analyse prestataire archivée, par son id. Retourne
     (donnees, message d'erreur ou None)."""
@@ -1126,89 +1146,83 @@ if id_presta_sidebar:
 
 supabase_ok = SUPABASE_DISPONIBLE and get_supabase_client()
 
-if supabase_ok:
-    st.markdown("### 📂 Dossiers déjà enregistrés")
-    col_g1, col_g2 = st.columns(2)
+data_rechargee = None
+presta_rechargee = None
 
-    with col_g1:
-        st.markdown("**Odicee** *(1 version conservée par dossier)*")
-        dossiers_enregistres = lister_dossiers_odicee()
-        if not dossiers_enregistres:
-            st.caption("Aucun dossier enregistré pour l'instant.")
-        else:
-            options_od = ["—"] + [
-                f"{d['numero_dossier']} ({d.get('fiche') or '?'}) — {d['date_maj'][:10]}"
-                for d in dossiers_enregistres
-            ]
-            choix_od = st.selectbox("Rechercher un numéro de dossier", options_od, key="rech_od")
-            if choix_od != "—":
-                numero_od = choix_od.split(" ")[0]
-                cb1, cb2 = st.columns(2)
-                if cb1.button("📥 Charger", key="charger_od_btn", use_container_width=True):
-                    donnees, err = charger_dossier_odicee(numero_od)
-                    st.session_state["_odicee_recharge"] = donnees
-                    if err:
-                        st.error(f"⚠️ Échec du rechargement : {err}")
-                    else:
-                        st.rerun()
-                if cb2.button("🗑️ Supprimer", key="suppr_od_btn", use_container_width=True):
-                    ok, err = supprimer_dossier_odicee(numero_od)
+if supabase_ok:
+    st.markdown("### 🔍 Retrouver un dossier déjà travaillé")
+
+    def _libelle_version(a):
+        date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
+        fiab_aff = f" · fiabilité {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
+        return f"{date_aff}{fiab_aff}"
+
+    numeros_connus = lister_tous_numeros_connus()
+    numero_recherche = st.selectbox(
+        "Numéro de dossier — tapez pour rechercher",
+        ["—"] + numeros_connus,
+        key="recherche_numero_unifiee",
+    )
+
+    if numero_recherche != "—":
+        col_r1, col_r2 = st.columns(2)
+
+        # ── Odicee : unique, chargement automatique ──
+        with col_r1:
+            data_auto, err_od = charger_dossier_odicee(numero_recherche)
+            if err_od:
+                st.warning(f"Odicee : {err_od}")
+            elif data_auto:
+                data_rechargee = data_auto
+                c1, c2 = st.columns([5, 1])
+                c1.caption(f"✅ Odicee {numero_recherche} chargé automatiquement.")
+                if c2.button("🗑️", key="suppr_od_unifie", help="Supprimer ce dossier Odicee"):
+                    ok, err = supprimer_dossier_odicee(numero_recherche)
                     if ok:
                         lister_dossiers_odicee.clear()
-                        st.session_state.pop("_odicee_recharge", None)
+                        lister_tous_numeros_connus.clear()
                         st.rerun()
                     else:
-                        st.error(f"⚠️ Échec de la suppression : {err}")
+                        st.error(f"⚠️ {err}")
+            else:
+                st.caption("Aucun JSON Odicee enregistré pour ce dossier — déposez-le ci-dessous.")
 
-    with col_g2:
-        st.markdown("**Prestataire** *(historique complet conservé)*")
-        analyses_enregistrees = lister_toutes_analyses_prestataire()
-        if not analyses_enregistrees:
-            st.caption("Aucune analyse enregistrée pour l'instant.")
-        else:
-            # Une entrée par dossier (la plus récente déjà en tête, la requête est triée desc)
-            versions_par_dossier = {}
-            for a in analyses_enregistrees:
-                versions_par_dossier.setdefault(a["numero_dossier"], []).append(a)
-
-            def _libelle(a):
-                date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
-                fiab_aff = f" · {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
-                return f"{date_aff}{fiab_aff}"
-
-            options_pr = ["—"] + [
-                f"{numero} ({versions[0].get('fiche') or '?'}) — dernière version : {_libelle(versions[0])}"
-                for numero, versions in versions_par_dossier.items()
-            ]
-            choix_pr = st.selectbox("Rechercher un numéro de dossier", options_pr, key="rech_pr")
-            if choix_pr != "—":
-                numero_pr = choix_pr.split(" ")[0]
-                versions = versions_par_dossier[numero_pr]
-                version_choisie = versions[0]
-                if len(versions) > 1:
-                    options_versions = [f"Dernière — {_libelle(versions[0])}"] + [
-                        f"Antérieure — {_libelle(v)}" for v in versions[1:]
+        # ── Prestataire : dernière version par défaut, sélecteur si historique ──
+        with col_r2:
+            historique = lister_historique_prestataire(numero_recherche)
+            if historique:
+                version_choisie = historique[0]
+                if len(historique) > 1:
+                    options_versions = [f"Dernière — {_libelle_version(historique[0])}"] + [
+                        f"Antérieure — {_libelle_version(v)}" for v in historique[1:]
                     ]
                     choix_version = st.selectbox(
-                        f"{len(versions)} versions disponibles pour {numero_pr}", options_versions, key="rech_pr_version"
+                        f"{len(historique)} versions prestataire", options_versions, key="version_pr_unifiee"
                     )
-                    version_choisie = versions[options_versions.index(choix_version)]
-                cb1, cb2 = st.columns(2)
-                if cb1.button("📥 Charger", key="charger_pr_btn", use_container_width=True):
-                    donnees, err = charger_analyse_prestataire(version_choisie["id"])
-                    st.session_state["_presta_recharge"] = donnees
-                    if err:
-                        st.error(f"⚠️ Échec du rechargement : {err}")
-                    else:
-                        st.rerun()
-                if cb2.button("🗑️ Supprimer cette version", key="suppr_pr_btn", use_container_width=True):
-                    ok, err = supprimer_analyse_prestataire(version_choisie["id"])
-                    if ok:
-                        lister_toutes_analyses_prestataire.clear()
-                        st.session_state.pop("_presta_recharge", None)
-                        st.rerun()
-                    else:
-                        st.error(f"⚠️ Échec de la suppression : {err}")
+                    version_choisie = historique[options_versions.index(choix_version)]
+                presta_auto, err_pr = charger_analyse_prestataire(version_choisie["id"])
+                if err_pr:
+                    st.warning(f"Prestataire : {err_pr}")
+                elif presta_auto:
+                    presta_rechargee = presta_auto
+                    c1, c2 = st.columns([5, 1])
+                    c1.caption(f"✅ Prestataire chargé ({_libelle_version(version_choisie)}).")
+                    if c2.button("🗑️", key="suppr_pr_unifie", help="Supprimer cette version prestataire"):
+                        ok, err = supprimer_analyse_prestataire(version_choisie["id"])
+                        if ok:
+                            lister_toutes_analyses_prestataire.clear()
+                            lister_tous_numeros_connus.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"⚠️ {err}")
+            else:
+                st.caption("Aucune analyse prestataire enregistrée pour ce dossier — déposez-la ci-dessous.")
+
+        st.caption(
+            "Pour retester ce dossier : le comparatif ci-dessus reflète la dernière analyse "
+            "connue — déposez juste le **nouveau** JSON prestataire ci-dessous, il remplace "
+            "automatiquement la version chargée pour cette comparaison (et s'ajoute à l'historique)."
+        )
 
     st.markdown("---")
 
@@ -1218,12 +1232,10 @@ with col_up1:
 with col_up2:
     fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
 
-data_rechargee = st.session_state.get("_odicee_recharge")
-presta_rechargee = st.session_state.get("_presta_recharge")
 if not (fichier_odicee or data_rechargee) or not (fichier_presta or presta_rechargee):
     st.info(
-        "Chargez le JSON Odicee et le JSON prestataire (ou sélectionnez-les ci-dessus depuis "
-        "les dossiers déjà enregistrés) pour lancer la comparaison."
+        "Chargez le JSON Odicee et le JSON prestataire (ou recherchez un dossier déjà "
+        "enregistré ci-dessus) pour lancer la comparaison."
     )
     st.stop()
 
@@ -1828,12 +1840,25 @@ with colex1:
     )
 with colex2:
     if modifications_odicee:
-        st.download_button(
-            "📥 Télécharger le JSON Odicee modifié",
-            data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name=f"{id_odicee}_modifie.json",
-            mime="application/json",
-        )
+        cdl1, cdl2 = st.columns(2)
+        with cdl1:
+            st.download_button(
+                "📥 Télécharger le JSON modifié",
+                data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name=f"{id_odicee}_modifie.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+        with cdl2:
+            if supabase_ok:
+                if st.button("💾 Mettre à jour dans Supabase", use_container_width=True):
+                    ok_maj, msg_maj = sauvegarder_dossier_odicee(data, fiche=fiche_odicee_match)
+                    if ok_maj:
+                        lister_dossiers_odicee.clear()
+                        lister_tous_numeros_connus.clear()
+                        st.success(f"✅ Dossier Odicee {id_odicee} mis à jour dans Supabase avec les modifications.")
+                    else:
+                        st.error(f"⚠️ Échec de la mise à jour : {msg_maj}")
     else:
         st.caption("Aucune modification apportée aux valeurs Odicee — rien à réexporter en JSON.")
 
