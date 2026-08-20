@@ -78,14 +78,14 @@ def get_supabase_client():
 
 def sauvegarder_dossier_odicee(data, fiche=None):
     """Enregistre (ou met à jour) le JSON Odicee dans Supabase, indexé par numéro de dossier.
-    Échoue silencieusement si Supabase n'est pas configuré — la persistance est un confort, pas
-    une dépendance bloquante pour utiliser l'app."""
+    Retourne (succès, message) — message explicite en cas d'échec (secrets absents, RLS,
+    erreur réseau...) plutôt qu'un échec silencieux impossible à diagnostiquer."""
     client = get_supabase_client()
     if not client:
-        return False
+        return False, "Supabase non configuré (secrets absents/invalides ou package non installé)."
     numero = f"{data.get('prefixe', '') or ''}{data.get('id', '')}"
     if not numero:
-        return False
+        return False, "Impossible de déterminer le numéro de dossier (champs 'id'/'prefixe' absents du JSON)."
     try:
         client.table("dossiers_odicee").upsert({
             "numero_dossier": numero,
@@ -93,9 +93,9 @@ def sauvegarder_dossier_odicee(data, fiche=None):
             "donnees": data,
             "date_maj": datetime.now().isoformat(),
         }).execute()
-        return True
-    except Exception:
-        return False
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -132,10 +132,13 @@ def charger_dossier_odicee(numero_dossier):
 def sauvegarder_analyse_prestataire(presta, numero_dossier, fiche):
     """Ajoute (n'écrase jamais) un enregistrement d'historique pour cette analyse prestataire —
     contrairement à l'Odicee, on garde toutes les versions pour pouvoir comparer l'évolution
-    dans le temps (ex : le prestataire s'améliore-t-il après une correction signalée ?)."""
+    dans le temps (ex : le prestataire s'améliore-t-il après une correction signalée ?).
+    Retourne (succès, message)."""
     client = get_supabase_client()
-    if not client or not numero_dossier:
-        return False
+    if not client:
+        return False, "Supabase non configuré (secrets absents/invalides ou package non installé)."
+    if not numero_dossier:
+        return False, "Numéro de dossier prestataire introuvable (champ 'fileNumber' absent du JSON)."
     report = presta.get("report") or {}
     try:
         client.table("dossiers_prestataire").insert({
@@ -146,9 +149,9 @@ def sauvegarder_analyse_prestataire(presta, numero_dossier, fiche):
             "donnees": presta,
             "date_analyse": presta.get("analyzedAt"),
         }).execute()
-        return True
-    except Exception:
-        return False
+        return True, None
+    except Exception as e:
+        return False, str(e)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1109,7 +1112,12 @@ filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or 
 if fichier_presta and filenumber_presta:
     # Historique conservé (insert, jamais d'écrasement) — contrairement à l'Odicee, chaque
     # nouvelle analyse prestataire est une version distincte, utile à comparer dans le temps.
-    sauvegarder_analyse_prestataire(presta, filenumber_presta, fiche_presta)
+    ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, filenumber_presta, fiche_presta)
+    if SUPABASE_DISPONIBLE and get_supabase_client():
+        if ok_presta:
+            st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
+        else:
+            st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
 
 # ── Vérification d'identité dossier ──
 st.markdown("### 🪪 Identification du dossier")
@@ -1185,9 +1193,14 @@ lots_par_fiche = get_odicee_lots_bar(data)
 fiche_odicee_match = next((f for f in lots_par_fiche if f.upper() == fiche_presta), None)
 
 if fichier_odicee and lots_par_fiche:
-    # Sauvegarde silencieuse dans Supabase à chaque nouvel upload (upsert : écrase la version
-    # précédente du même dossier). Sans effet si Supabase n'est pas configuré.
-    sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
+    # Sauvegarde dans Supabase à chaque nouvel upload (upsert : écrase la version précédente
+    # du même dossier). Message explicite en cas d'échec pour pouvoir diagnostiquer.
+    ok_odicee, msg_odicee = sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
+    if SUPABASE_DISPONIBLE and get_supabase_client():
+        if ok_odicee:
+            st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
+        else:
+            st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
 
 if not fiche_odicee_match:
     st.error(
