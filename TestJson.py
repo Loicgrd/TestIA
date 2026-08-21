@@ -35,6 +35,8 @@ import io
 import csv
 import zipfile
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 
 import fitz  # PyMuPDF
 from PIL import Image
@@ -51,6 +53,7 @@ except Exception:
     OCR_DISPONIBLE = False
 
 from utils import REGLES, decoder_valeur, seuil_r_en101, champs_en104, CHAMPS_CUMULABLES
+from logique_comparaison import calculer_fiabilite
 
 try:
     from supabase import create_client
@@ -337,6 +340,47 @@ def supprimer_commentaire(id_commentaire):
         return True, None
     except Exception as e:
         return False, str(e)
+
+
+def enregistrer_fiabilite(id_analyse, resume):
+    """Enregistre le résumé de fiabilité (nb_concordant/ecart/partiel/absent) calculé pour
+    cette analyse prestataire — alimente le tableau de bord de suivi. Retourne (succès, message)."""
+    client = get_supabase_client()
+    if not client or not id_analyse or not resume:
+        return False, "Supabase non configuré ou données manquantes."
+    try:
+        client.table("dossiers_prestataire").update({
+            "nb_concordant": resume["nb_concordant"],
+            "nb_ecart": resume["nb_ecart"],
+            "nb_partiel": resume["nb_partiel"],
+            "nb_absent": resume["nb_absent"],
+            "date_calcul_fiabilite": datetime.now().isoformat(),
+        }).eq("id", id_analyse).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def charger_toutes_analyses():
+    """Toutes les analyses prestataire avec leur résumé de fiabilité (colonnes légères
+    uniquement, jamais le JSON complet) — alimente l'onglet Suivi de fiabilité."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        res = (
+            client.table("dossiers_prestataire")
+            .select("id, numero_dossier, fiche, reliability_score, overall_status, "
+                    "nb_concordant, nb_ecart, nb_partiel, nb_absent, "
+                    "date_analyse, date_ajout, date_calcul_fiabilite")
+            .order("numero_dossier")
+            .order("date_ajout")
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
 
 
 def charger_analyse_prestataire(id_analyse):
@@ -1204,1048 +1248,1220 @@ def trouver_fichier_zip(zip_files, nom_cible):
 # UI
 # ─────────────────────────────────────────────
 
-st.title("🔀 Comparateur — Odicee vs Prestataire IA")
-st.caption(
-    "Importez le JSON Odicee du dossier et le JSON produit par le prestataire pour "
-    "confronter les valeurs extraites champ par champ."
-)
+tab_comparateur, tab_fiabilite = st.tabs(["🔀 Comparateur", "📊 Suivi de fiabilité"])
 
-st.sidebar.header("🔗 Raccourci API")
-num_dossier_sidebar = st.sidebar.text_input("Numéro de dossier Odicee (ex: T239148)")
-if num_dossier_sidebar:
-    num_clean = re.sub(r"\D", "", num_dossier_sidebar)
-    if num_clean:
+with tab_fiabilite:
+    st.title("📊 Suivi de fiabilité")
+    st.caption(
+        "Évolution du nombre de concordances/écarts entre Odicee et les analyses successives "
+        "du prestataire, tous dossiers confondus — pour repérer si les règles d'extraction "
+        "s'affinent, et détecter rapidement une régression après une mise à jour du prestataire."
+    )
+
+    if not SUPABASE_DISPONIBLE or not get_supabase_client():
+        st.warning(
+            "⚠️ Supabase n'est pas configuré sur cette app — ce tableau de bord a besoin de "
+            "l'historique persistant pour fonctionner (voir l'onglet Comparateur pour la config)."
+        )
+    else:
+        with st.expander("🔄 Recalculer les résumés de fiabilité"):
+            tout_recalculer = st.checkbox(
+                "Tout recalculer (même les analyses déjà calculées)", value=False,
+                help="Décoché : ne calcule que les analyses qui n'ont pas encore de résumé — plus rapide.",
+                key="fiab_tout_recalculer",
+            )
+            if st.button("Lancer le recalcul", key="fiab_lancer_recalcul"):
+                client_fiab = get_supabase_client()
+                toutes_analyses_fraiches = charger_toutes_analyses.__wrapped__()
+                a_traiter = toutes_analyses_fraiches if tout_recalculer else [
+                    a for a in toutes_analyses_fraiches if a.get("nb_concordant") is None
+                ]
+                if not a_traiter:
+                    st.success("Rien à recalculer — tout est déjà à jour.")
+                else:
+                    barre_fiab = st.progress(0.0)
+                    compteur_ok, compteur_echec = 0, 0
+                    for i_fiab, analyse_fiab in enumerate(a_traiter):
+                        try:
+                            res_od_fiab = (
+                                client_fiab.table("dossiers_odicee").select("donnees")
+                                .eq("numero_dossier", analyse_fiab["numero_dossier"]).single().execute()
+                            )
+                            res_pr_fiab = (
+                                client_fiab.table("dossiers_prestataire").select("donnees")
+                                .eq("id", analyse_fiab["id"]).single().execute()
+                            )
+                            if res_od_fiab.data and res_pr_fiab.data:
+                                resume_fiab = calculer_fiabilite(res_od_fiab.data["donnees"], res_pr_fiab.data["donnees"])
+                                if resume_fiab:
+                                    client_fiab.table("dossiers_prestataire").update({
+                                        **resume_fiab,
+                                        "date_calcul_fiabilite": datetime.now().isoformat(),
+                                    }).eq("id", analyse_fiab["id"]).execute()
+                                    compteur_ok += 1
+                                else:
+                                    compteur_echec += 1
+                            else:
+                                compteur_echec += 1
+                        except Exception:
+                            compteur_echec += 1
+                        barre_fiab.progress((i_fiab + 1) / len(a_traiter))
+                    charger_toutes_analyses.clear()
+                    st.success(f"Terminé : {compteur_ok} analyse(s) calculée(s), {compteur_echec} ignorée(s)/en échec.")
+
+        analyses_fiab = charger_toutes_analyses()
+        analyses_calculees_fiab = [a for a in analyses_fiab if a.get("nb_concordant") is not None]
+
+        if not analyses_calculees_fiab:
+            st.info(
+                "Aucun résumé de fiabilité calculé pour l'instant. Consultez des dossiers dans "
+                "l'onglet Comparateur (ça se calcule automatiquement), ou lancez un recalcul ci-dessus."
+            )
+        else:
+            for a in analyses_calculees_fiab:
+                total_fiab = a["nb_concordant"] + a["nb_ecart"]
+                a["fiabilite"] = a["nb_concordant"] / total_fiab if total_fiab else None
+                a["date_ref"] = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
+
+            st.markdown("## 1. Tendance globale")
+            df_fiab = pd.DataFrame(analyses_calculees_fiab)
+            df_avec_fiab = df_fiab[df_fiab["fiabilite"].notna()].copy()
+            df_avec_fiab["date_ref"] = pd.to_datetime(df_avec_fiab["date_ref"], errors="coerce")
+            df_avec_fiab = df_avec_fiab.dropna(subset=["date_ref"]).sort_values("date_ref")
+
+            if not df_avec_fiab.empty:
+                tendance_fiab = (
+                    df_avec_fiab.groupby(df_avec_fiab["date_ref"].dt.date)["fiabilite"].mean().reset_index()
+                )
+                tendance_fiab.columns = ["Date", "Fiabilité moyenne"]
+                fig_tendance = px.line(
+                    tendance_fiab, x="Date", y="Fiabilité moyenne", markers=True,
+                    title="Fiabilité moyenne (tous dossiers) au fil des analyses",
+                )
+                fig_tendance.update_yaxes(tickformat=".0%", range=[0, 1])
+                fig_tendance.update_layout(height=350)
+                st.plotly_chart(fig_tendance, use_container_width=True)
+            else:
+                st.caption("Pas assez de dates exploitables pour tracer une tendance.")
+
+            colm1, colm2, colm3 = st.columns(3)
+            colm1.metric("Analyses avec résumé", len(analyses_calculees_fiab))
+            colm2.metric("Dossiers distincts", df_fiab["numero_dossier"].nunique())
+            if not df_avec_fiab.empty:
+                colm3.metric("Fiabilité moyenne globale", f"{df_avec_fiab['fiabilite'].mean()*100:.0f}%")
+
+            st.markdown("## 2. Évolution par dossier")
+            st.caption(
+                "Chaque colonne = une analyse successive du même dossier (v1 = la plus ancienne). "
+                "Couleur = fiabilité (🔴 faible → 🟢 élevée)."
+            )
+            lignes_matrice = {}
+            for a in analyses_calculees_fiab:
+                lignes_matrice.setdefault(a["numero_dossier"], []).append(a)
+            max_versions = max((len(v) for v in lignes_matrice.values()), default=0)
+            data_matrice, labels_dossiers = [], []
+            for numero, versions in sorted(lignes_matrice.items()):
+                ligne = [v["fiabilite"] for v in versions] + [None] * (max_versions - len(versions))
+                data_matrice.append(ligne)
+                labels_dossiers.append(f"{numero} ({versions[0].get('fiche') or '?'})")
+
+            if data_matrice:
+                fig_matrice = go.Figure(data=go.Heatmap(
+                    z=data_matrice,
+                    x=[f"v{i+1}" for i in range(max_versions)],
+                    y=labels_dossiers,
+                    colorscale=[[0, "#C0392B"], [0.5, "#F1C40F"], [1, "#27AE60"]],
+                    zmin=0, zmax=1,
+                    text=[[f"{v*100:.0f}%" if v is not None else "" for v in ligne] for ligne in data_matrice],
+                    texttemplate="%{text}",
+                    hovertemplate="%{y}<br>%{x} : %{z:.0%}<extra></extra>",
+                    colorbar=dict(title="Fiabilité", tickformat=".0%"),
+                ))
+                fig_matrice.update_layout(height=max(300, 28 * len(labels_dossiers)), yaxis=dict(autorange="reversed"))
+                st.plotly_chart(fig_matrice, use_container_width=True)
+
+            st.markdown("## 3. 🚨 Régressions détectées")
+            st.caption("Dossiers dont la fiabilité a baissé entre les deux dernières analyses.")
+            regressions_fiab = []
+            for numero, versions in lignes_matrice.items():
+                avec_fiab = [v for v in versions if v["fiabilite"] is not None]
+                if len(avec_fiab) < 2:
+                    continue
+                derniere, avant_derniere = avec_fiab[-1], avec_fiab[-2]
+                if derniere["fiabilite"] < avant_derniere["fiabilite"]:
+                    regressions_fiab.append({
+                        "Dossier": numero, "Fiche": derniere.get("fiche") or "?",
+                        "Avant": f"{avant_derniere['fiabilite']*100:.0f}%",
+                        "Après": f"{derniere['fiabilite']*100:.0f}%",
+                        "Écart": f"{(derniere['fiabilite'] - avant_derniere['fiabilite'])*100:+.0f} pts",
+                        "Date avant": avant_derniere["date_ref"], "Date après": derniere["date_ref"],
+                    })
+            if regressions_fiab:
+                st.dataframe(pd.DataFrame(regressions_fiab).sort_values("Écart"), use_container_width=True, hide_index=True)
+            else:
+                st.success("Aucune régression détectée sur les dossiers ayant au moins 2 analyses.")
+
+            with st.expander("📋 Détail complet (toutes les analyses calculées)"):
+                df_detail_fiab = df_fiab[["numero_dossier", "fiche", "date_ref", "nb_concordant", "nb_ecart",
+                                           "nb_partiel", "nb_absent", "fiabilite"]].copy()
+                df_detail_fiab["fiabilite"] = df_detail_fiab["fiabilite"].apply(
+                    lambda v: f"{v*100:.0f}%" if v is not None else "—"
+                )
+                df_detail_fiab.columns = ["Dossier", "Fiche", "Date", "Concordant", "Écart", "Partiel", "Absent", "Fiabilité"]
+                st.dataframe(df_detail_fiab.sort_values(["Dossier", "Date"]), use_container_width=True, hide_index=True)
+
+
+with tab_comparateur:
+    st.title("🔀 Comparateur — Odicee vs Prestataire IA")
+    st.caption(
+        "Importez le JSON Odicee du dossier et le JSON produit par le prestataire pour "
+        "confronter les valeurs extraites champ par champ."
+    )
+
+    st.sidebar.header("🔗 Raccourci API")
+    num_dossier_sidebar = st.sidebar.text_input("Numéro de dossier Odicee (ex: T239148)")
+    if num_dossier_sidebar:
+        num_clean = re.sub(r"\D", "", num_dossier_sidebar)
+        if num_clean:
+            st.sidebar.markdown(
+                f'<a href="https://odicee.edf.fr/api/dossiers/{num_clean}" target="_blank">➡️ JSON Odicee {num_clean}</a>',
+                unsafe_allow_html=True,
+            )
+            st.sidebar.caption("Ctrl+S sur la page pour sauvegarder, puis importez ci-dessous.")
+
+    st.sidebar.markdown("---")
+    id_presta_sidebar = st.sidebar.text_input(
+        "ID Prestataire (identifiant technique, pas le n° de dossier — ex: ce850dc69bf643b3ba4973f9aaf682d4)"
+    )
+    if id_presta_sidebar:
         st.sidebar.markdown(
-            f'<a href="https://odicee.edf.fr/api/dossiers/{num_clean}" target="_blank">➡️ JSON Odicee {num_clean}</a>',
+            f'<a href="https://docminddev.promotelec-services.com/api/dossiers/{id_presta_sidebar.strip()}" target="_blank">➡️ JSON Prestataire</a>',
             unsafe_allow_html=True,
         )
-        st.sidebar.caption("Ctrl+S sur la page pour sauvegarder, puis importez ci-dessous.")
-
-st.sidebar.markdown("---")
-id_presta_sidebar = st.sidebar.text_input(
-    "ID Prestataire (identifiant technique, pas le n° de dossier — ex: ce850dc69bf643b3ba4973f9aaf682d4)"
-)
-if id_presta_sidebar:
-    st.sidebar.markdown(
-        f'<a href="https://docminddev.promotelec-services.com/api/dossiers/{id_presta_sidebar.strip()}" target="_blank">➡️ JSON Prestataire</a>',
-        unsafe_allow_html=True,
-    )
-    st.sidebar.caption(
-        "Cet identifiant n'est pas déductible du n° de dossier — une fois le JSON prestataire "
-        "chargé ci-dessous, le lien correspondant s'affiche automatiquement."
-    )
-
-supabase_ok = SUPABASE_DISPONIBLE and get_supabase_client()
-
-data_rechargee = None
-presta_rechargee = None
-id_analyse_active = None  # id Supabase de l'analyse prestataire actuellement affichée (pour les commentaires)
-
-if supabase_ok:
-    try:
-        st.markdown("### 🔍 Retrouver un dossier déjà travaillé")
-
-        def _libelle_version(a):
-            date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
-            fiab_aff = f" · fiabilité {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
-            return f"{date_aff}{fiab_aff}"
-
-        numeros_connus = lister_tous_numeros_connus()
-        numero_recherche = st.selectbox(
-            "Numéro de dossier — tapez pour rechercher",
-            ["—"] + numeros_connus,
-            key="recherche_numero_unifiee",
+        st.sidebar.caption(
+            "Cet identifiant n'est pas déductible du n° de dossier — une fois le JSON prestataire "
+            "chargé ci-dessous, le lien correspondant s'affiche automatiquement."
         )
 
-        if numero_recherche != "—":
-            col_r1, col_r2 = st.columns(2)
+    supabase_ok = SUPABASE_DISPONIBLE and get_supabase_client()
 
-            # ── Odicee : unique, chargement automatique ──
-            with col_r1:
-                data_auto, err_od = charger_dossier_odicee(numero_recherche)
-                if err_od:
-                    st.warning(f"Odicee : {err_od}")
-                elif data_auto:
-                    data_rechargee = data_auto
-                    c1, c2 = st.columns([5, 1])
-                    c1.caption(f"✅ Odicee {numero_recherche} chargé automatiquement.")
-                    if c2.button("🗑️", key="suppr_od_unifie", help="Supprimer ce dossier Odicee"):
-                        ok, err = supprimer_dossier_odicee(numero_recherche)
-                        if ok:
-                            lister_dossiers_odicee.clear()
-                            lister_tous_numeros_connus.clear()
-                            st.rerun()
-                        else:
-                            st.error(f"⚠️ {err}")
-                else:
-                    st.caption("Aucun JSON Odicee enregistré pour ce dossier — déposez-le ci-dessous.")
+    data_rechargee = None
+    presta_rechargee = None
+    id_analyse_active = None  # id Supabase de l'analyse prestataire actuellement affichée (pour les commentaires)
 
-            # ── Prestataire : dernière version par défaut, sélecteur si historique ──
-            with col_r2:
-                historique = lister_historique_prestataire(numero_recherche)
-                if historique:
-                    version_choisie = historique[0]
-                    if len(historique) > 1:
-                        options_versions = [f"Dernière — {_libelle_version(historique[0])}"] + [
-                            f"Antérieure — {_libelle_version(v)}" for v in historique[1:]
-                        ]
-                        choix_version = st.selectbox(
-                            f"{len(historique)} versions prestataire", options_versions, key="version_pr_unifiee"
-                        )
-                        version_choisie = historique[options_versions.index(choix_version)]
-                    presta_auto, err_pr = charger_analyse_prestataire(version_choisie["id"])
-                    if err_pr:
-                        st.warning(f"Prestataire : {err_pr}")
-                    elif presta_auto:
-                        presta_rechargee = presta_auto
-                        id_analyse_active = version_choisie["id"]
+    if supabase_ok:
+        try:
+            st.markdown("### 🔍 Retrouver un dossier déjà travaillé")
+
+            def _libelle_version(a):
+                date_aff = (a.get("date_analyse") or a.get("date_ajout") or "")[:10]
+                fiab_aff = f" · fiabilité {a['reliability_score']*100:.0f}%" if a.get("reliability_score") is not None else ""
+                return f"{date_aff}{fiab_aff}"
+
+            numeros_connus = lister_tous_numeros_connus()
+            numero_recherche = st.selectbox(
+                "Numéro de dossier — tapez pour rechercher",
+                ["—"] + numeros_connus,
+                key="recherche_numero_unifiee",
+            )
+
+            if numero_recherche != "—":
+                col_r1, col_r2 = st.columns(2)
+
+                # ── Odicee : unique, chargement automatique ──
+                with col_r1:
+                    data_auto, err_od = charger_dossier_odicee(numero_recherche)
+                    if err_od:
+                        st.warning(f"Odicee : {err_od}")
+                    elif data_auto:
+                        data_rechargee = data_auto
                         c1, c2 = st.columns([5, 1])
-                        c1.caption(f"✅ Prestataire chargé ({_libelle_version(version_choisie)}).")
-                        if c2.button("🗑️", key="suppr_pr_unifie", help="Supprimer cette version prestataire"):
-                            ok, err = supprimer_analyse_prestataire(version_choisie["id"])
+                        c1.caption(f"✅ Odicee {numero_recherche} chargé automatiquement.")
+                        if c2.button("🗑️", key="suppr_od_unifie", help="Supprimer ce dossier Odicee"):
+                            ok, err = supprimer_dossier_odicee(numero_recherche)
                             if ok:
-                                lister_toutes_analyses_prestataire.clear()
+                                lister_dossiers_odicee.clear()
                                 lister_tous_numeros_connus.clear()
-                                lister_historique_prestataire.clear()
                                 st.rerun()
                             else:
                                 st.error(f"⚠️ {err}")
-                else:
-                    st.caption("Aucune analyse prestataire enregistrée pour ce dossier — déposez-la ci-dessous.")
-
-            st.caption(
-                "Pour retester ce dossier : le comparatif ci-dessus reflète la dernière analyse "
-                "connue — déposez juste le **nouveau** JSON prestataire ci-dessous, il remplace "
-                "automatiquement la version chargée pour cette comparaison (et s'ajoute à l'historique)."
-            )
-    except Exception as _e_recherche:
-        st.error(
-            f"⚠️ La recherche de dossiers enregistrés a rencontré un problème et a été "
-            f"désactivée pour cette page (l'upload manuel ci-dessous reste disponible) : {_e_recherche}"
-        )
-        st.session_state.pop("recherche_numero_unifiee", None)
-
-    st.markdown("---")
-
-col_up1, col_up2 = st.columns(2)
-with col_up1:
-    fichier_odicee = st.file_uploader("JSON Odicee (dossier)", type="json", key="odicee")
-with col_up2:
-    fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
-
-if not (fichier_odicee or data_rechargee) or not (fichier_presta or presta_rechargee):
-    st.info(
-        "Chargez le JSON Odicee et le JSON prestataire (ou recherchez un dossier déjà "
-        "enregistré ci-dessus) pour lancer la comparaison."
-    )
-    st.stop()
-
-if fichier_odicee:
-    try:
-        data = json.load(fichier_odicee)
-    except Exception as e:
-        st.error(f"JSON Odicee invalide : {e}")
-        st.stop()
-else:
-    data = data_rechargee
-
-if fichier_presta:
-    try:
-        presta = json.load(fichier_presta)
-    except Exception as e:
-        st.error(f"JSON Prestataire invalide : {e}")
-        st.stop()
-else:
-    presta = presta_rechargee
-
-report = presta.get("report") or {}
-documents_presta = report.get("documents", []) or []
-fiche_presta = str(report.get("barReference", "")).upper()
-filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
-# Le prestataire n'inclut pas toujours le préfixe "T" (ex: "176444" au lieu de "T176444") et
-# ajoute parfois un suffixe de version (ex: "T155418 V2") — normalisation vers la même clé
-# canonique que côté Odicee, pour que les deux se retrouvent dans le même historique.
-numero_dossier_presta = normaliser_numero_dossier(filenumber_presta)
-
-cle_session_presta = f"_presta_deja_sauvegarde_{getattr(fichier_presta, 'file_id', None) or (fichier_presta.name if fichier_presta else None)}"
-if fichier_presta and filenumber_presta and not st.session_state.get(cle_session_presta):
-    # Sauvegarde dans Supabase une seule fois par fichier réellement uploadé — pas à chaque
-    # interaction/rerun de la page (ex: ajouter un commentaire), sinon chaque clic redéclenche
-    # un aller-retour réseau inutile (vérification anti-doublon + insertion).
-    ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, numero_dossier_presta, fiche_presta)
-    if ok_presta and msg_presta == "identique":
-        st.toast(f"ℹ️ Identique à la dernière version enregistrée pour {numero_dossier_presta} — pas de doublon créé.", icon="ℹ️")
-        lister_toutes_analyses_prestataire.clear()
-    elif ok_presta:
-        st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
-        lister_toutes_analyses_prestataire.clear()
-        lister_historique_prestataire.clear()
-        lister_tous_numeros_connus.clear()
-    else:
-        st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
-    if ok_presta and supabase_ok:
-        # Retrouve l'id Supabase de cette analyse (celle qu'on vient d'insérer, ou celle déjà
-        # identique) pour pouvoir y rattacher des commentaires — mémorisé pour ne pas avoir à
-        # requêter Supabase de nouveau à chaque rerun tant que c'est le même fichier.
-        _historique_maj = lister_historique_prestataire(numero_dossier_presta)
-        if _historique_maj:
-            id_analyse_active = _historique_maj[0]["id"]
-            st.session_state["_id_analyse_active_courante"] = id_analyse_active
-    st.session_state[cle_session_presta] = True
-elif fichier_presta and st.session_state.get("_id_analyse_active_courante"):
-    id_analyse_active = st.session_state["_id_analyse_active_courante"]
-
-# ── Vérification d'identité dossier ──
-st.markdown("### 🪪 Identification du dossier")
-dossier_id = str(data.get("id", ""))
-prefixe = data.get("prefixe", "") or ""
-id_odicee = f"{prefixe}{dossier_id}"
-id_presta_clean = re.sub(r"^\D+", "", filenumber_presta)
-
-c1, c2, c3 = st.columns(3)
-c1.metric("N° dossier Odicee", id_odicee)
-c2.metric("N° dossier Prestataire", filenumber_presta or "—")
-match_id = dossier_id == id_presta_clean
-c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart — vérifier le rapprochement'}")
-
-if dossier_id:
-    url_odicee = f"https://odicee.edf.fr/api/dossiers/{dossier_id}"
-    url_odicee_appli = f"https://odicee.edf.fr/dossiers/{dossier_id}"
-    liens = [
-        f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>',
-        f'<a href="{url_odicee_appli}" target="_blank">🔗 Ouvrir le dossier Odicee</a>',
-    ]
-    id_technique_presta = presta.get("id")
-    if id_technique_presta:
-        url_presta = f"https://docminddev.promotelec-services.com/api/dossiers/{id_technique_presta}"
-        url_presta_appli = f"https://docminddev.promotelec-services.com/dossier/{id_technique_presta}"
-        liens.append(f'<a href="{url_presta}" target="_blank">🔗 Ouvrir le JSON Prestataire (API)</a>')
-        liens.append(f'<a href="{url_presta_appli}" target="_blank">🔗 Ouvrir le dossier Prestataire</a>')
-    st.markdown("&nbsp;&nbsp;·&nbsp;&nbsp;".join(liens), unsafe_allow_html=True)
-
-if not match_id:
-    st.warning(
-        "⚠️ Le numéro de dossier du rapport prestataire ne correspond pas au JSON Odicee chargé. "
-        "Vérifiez que vous comparez bien le même dossier avant d'interpréter les écarts ci-dessous."
-    )
-
-# ── Historique des analyses prestataire pour ce dossier ──
-if SUPABASE_DISPONIBLE and get_supabase_client() and filenumber_presta:
-    historique = lister_historique_prestataire(filenumber_presta)
-    if len(historique) > 1:
-        with st.expander(f"🕓 Historique des analyses prestataire pour {filenumber_presta} ({len(historique)} versions)"):
-            df_hist = pd.DataFrame([
-                {
-                    "Date d'analyse": (h.get("date_analyse") or h.get("date_ajout") or "")[:19].replace("T", " "),
-                    "Fiabilité": f"{h['reliability_score']*100:.0f}%" if h.get("reliability_score") is not None else "—",
-                    "Statut global": h.get("overall_status") or "—",
-                }
-                for h in historique
-            ])
-            st.table(df_hist)
-
-            versions_labels = [
-                f"{(h.get('date_analyse') or h.get('date_ajout') or '')[:19].replace('T', ' ')} "
-                f"(fiabilité {h['reliability_score']*100:.0f}%)" if h.get("reliability_score") is not None
-                else (h.get("date_analyse") or h.get("date_ajout") or "")[:19].replace("T", " ")
-                for h in historique
-            ]
-            choix_ancien = st.selectbox(
-                "Comparer la version actuelle à une version antérieure :",
-                ["—"] + versions_labels[1:],  # la plus récente (index 0) = celle chargée maintenant
-            )
-            if choix_ancien != "—":
-                idx_choisi = versions_labels.index(choix_ancien)
-                ancien_presta, erreur_ancien = charger_analyse_prestataire(historique[idx_choisi]["id"])
-                if erreur_ancien:
-                    st.error(f"⚠️ Échec du rechargement de cette version : {erreur_ancien}")
-                elif ancien_presta:
-                    diff = comparer_deux_analyses_prestataire(ancien_presta, presta)
-                    diff_changes = [d for d in diff if d[3]]
-                    if diff_changes:
-                        st.markdown(f"**{len(diff_changes)} champ(s) modifié(s) depuis cette version :**")
-                        st.table(pd.DataFrame(
-                            [{"Champ": c, "Ancienne valeur": va, "Nouvelle valeur": vn} for c, va, vn, _ in diff_changes]
-                        ))
                     else:
-                        st.caption("Aucune différence détectée sur les champs techniques extraits entre ces deux versions.")
+                        st.caption("Aucun JSON Odicee enregistré pour ce dossier — déposez-le ci-dessous.")
 
-st.markdown("---")
+                # ── Prestataire : dernière version par défaut, sélecteur si historique ──
+                with col_r2:
+                    historique = lister_historique_prestataire(numero_recherche)
+                    if historique:
+                        version_choisie = historique[0]
+                        if len(historique) > 1:
+                            options_versions = [f"Dernière — {_libelle_version(historique[0])}"] + [
+                                f"Antérieure — {_libelle_version(v)}" for v in historique[1:]
+                            ]
+                            choix_version = st.selectbox(
+                                f"{len(historique)} versions prestataire", options_versions, key="version_pr_unifiee"
+                            )
+                            version_choisie = historique[options_versions.index(choix_version)]
+                        presta_auto, err_pr = charger_analyse_prestataire(version_choisie["id"])
+                        if err_pr:
+                            st.warning(f"Prestataire : {err_pr}")
+                        elif presta_auto:
+                            presta_rechargee = presta_auto
+                            id_analyse_active = version_choisie["id"]
+                            c1, c2 = st.columns([5, 1])
+                            c1.caption(f"✅ Prestataire chargé ({_libelle_version(version_choisie)}).")
+                            if c2.button("🗑️", key="suppr_pr_unifie", help="Supprimer cette version prestataire"):
+                                ok, err = supprimer_analyse_prestataire(version_choisie["id"])
+                                if ok:
+                                    lister_toutes_analyses_prestataire.clear()
+                                    lister_tous_numeros_connus.clear()
+                                    lister_historique_prestataire.clear()
+                                    st.rerun()
+                                else:
+                                    st.error(f"⚠️ {err}")
+                    else:
+                        st.caption("Aucune analyse prestataire enregistrée pour ce dossier — déposez-la ci-dessous.")
 
-# ── Sélection du lot Odicee correspondant à la fiche du rapport prestataire ──
-lots_par_fiche = get_odicee_lots_bar(data)
-fiche_odicee_match = next((f for f in lots_par_fiche if f.upper() == fiche_presta), None)
-
-cle_session_odicee = f"_odicee_deja_sauvegarde_{getattr(fichier_odicee, 'file_id', None) or (fichier_odicee.name if fichier_odicee else None)}"
-if fichier_odicee and lots_par_fiche and not st.session_state.get(cle_session_odicee):
-    # Sauvegarde dans Supabase une seule fois par fichier réellement uploadé (upsert : écrase
-    # la version précédente du même dossier) — pas à chaque interaction/rerun de la page (ex:
-    # ajouter un commentaire), sinon chaque clic redéclenche un aller-retour réseau inutile.
-    ok_odicee, msg_odicee = sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
-    st.session_state[cle_session_odicee] = True
-    if ok_odicee:
-        st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
-        lister_dossiers_odicee.clear()
-        lister_tous_numeros_connus.clear()
-    else:
-        st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
-
-if not fiche_odicee_match:
-    st.error(
-        f"Aucun lot Odicee avec la fiche **{fiche_presta or '—'}** trouvé dans ce dossier. "
-        f"Fiches disponibles côté Odicee : {', '.join(lots_par_fiche) or '—'}."
-    )
-    st.stop()
-
-lots_sites = lots_par_fiche[fiche_odicee_match]
-if len(lots_sites) > 1:
-    adresses = [a for _, a in lots_sites]
-    choix = st.selectbox("Plusieurs sites pour cette fiche — choisir celui à comparer :", adresses)
-    lot, adresse_site = next((l, a) for l, a in lots_sites if a == choix)
-else:
-    lot, adresse_site = lots_sites[0]
-
-fd = lot.get("formData", {}) or {}
-
-st.markdown(f"### 📋 Fiche comparée : **{fiche_odicee_match}** — {adresse_site}")
-
-# ── Comparaison des dates & identité chantier (niveau dossier) ──
-st.markdown("#### 📅 Dates & identité chantier")
-doc_engagement = (
-    get_presta_doc_par_regle(report, "DOSSIER_HAS_ENGAGEMENT")
-    or get_presta_doc(report, "EngagementAct")
-    or get_presta_doc(report, "PurchaseOrder")
-    or get_presta_doc(report, "ServiceOrder")
-    or get_presta_doc(report, "LetterOfCommand")
-    # "Quote" (devis) n'est pas idéal comme preuve d'engagement (c'est une offre, pas un accord
-    # signé) mais certains dossiers n'ont que ça — mieux vaut l'utiliser en dernier recours que
-    # de ne rien détecter du tout.
-    or get_presta_doc(report, "Quote")
-)
-doc_realisation = (
-    get_presta_doc_par_regle(report, "DOSSIER_HAS_COMPLETION")
-    or get_presta_doc_alias(report, "Invoice")
-)
-
-rows_identite = []
-modifications_odicee = []  # (fiche, cle_od, ancienne_valeur, nouvelle_valeur) — édité par l'utilisateur
-
-date_eng_odicee = fmt_ts(data.get("dateEngagementReelle"))
-date_eng_presta = (doc_engagement or {}).get("extractedFields", {}).get("documentDate") or \
-                   (doc_engagement or {}).get("extractedFields", {}).get("signatureDate")
-rows_identite.append(("Date d'engagement", date_eng_odicee, fmt_date_any(date_eng_presta)))
-
-date_real_odicee = fmt_ts(data.get("dateRealisationReelle"))
-date_real_presta = (doc_realisation or {}).get("extractedFields", {}).get("documentDate")
-rows_identite.append(("Date de réalisation", date_real_odicee, fmt_date_any(date_real_presta)))
-
-adresse_fd = " ".join(filter(None, [
-    fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
-])) or None
-adresse_presta, doc_adresse_presta = get_presta_works_address(report, doc_realisation, doc_engagement)
-rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
-
-prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
-# `professionnel` est tantôt le maître d'œuvre, tantôt un mandataire/apporteur d'affaire — jamais
-# fiable à l'aveugle. Le SIRET à comparer aux documents prestataire (facture/RGE) est celui du
-# professionnel ayant réellement réalisé les travaux : voir trouver_professionnel_installateur(),
-# qui confronte chaque candidat Odicee au SIRET de la facture pour lever l'ambiguïté.
-siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
-titulaire, avertissement_installateur = trouver_professionnel_installateur(data, lot, siret_presta)
-siret_odicee = titulaire.get("siret")
-rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
-
-# Sous-traitant : n'affiché que si au moins un côté en a un (dossier avec DC4 / RGE distinct
-# du titulaire), pour ne pas ajouter une ligne "—/—" sur les dossiers sans sous-traitance.
-sous_traitant_od = lot.get("professionnelSousTraitant")
-sous_traitant_od = sous_traitant_od if isinstance(sous_traitant_od, dict) else {}
-siret_sous_traitant_od = sous_traitant_od.get("siret")
-
-doc_rge = get_presta_doc(report, "RgeCertificate")
-siret_rge = (doc_rge or {}).get("extractedFields", {}).get("siret")
-# Le RGE n'est un "sous-traitant côté prestataire" que s'il diffère du titulaire (sinon c'est
-# simplement le certificat RGE du titulaire lui-même, rien d'anormal).
-siret_sous_traitant_presta = siret_rge if (siret_rge and siret_rge != siret_odicee) else None
-
-if siret_sous_traitant_od or siret_sous_traitant_presta:
-    rows_identite.append(("SIRET sous-traitant", siret_sous_traitant_od, siret_sous_traitant_presta))
-
-lignes_html = []
-for label, v_od, v_pr in rows_identite:
-    statut, detail = comparer(v_od, v_pr, tolerance=0)
-    lignes_html.append((badge(statut), label, f"{v_od}" if v_od else "—", f"{v_pr}" if v_pr else "—", detail or ""))
-
-df_identite = pd.DataFrame(
-    {
-        "": [l[0] for l in lignes_html],
-        "Champ": [l[1] for l in lignes_html],
-        "Odicee": [l[2] for l in lignes_html],
-        "Prestataire": [l[3] for l in lignes_html],
-        "Détail écart": [l[4] for l in lignes_html],
-    }
-)
-df_identite_edite = st.data_editor(
-    df_identite,
-    disabled=["", "Champ", "Prestataire", "Détail écart"],
-    column_config={"Odicee": st.column_config.TextColumn("Odicee ✏️")},
-    hide_index=True,
-    key=f"editeur_identite_{fiche_odicee_match}_{adresse_site}",
-)
-st.caption(
-    "✏️ Colonne Odicee modifiable. Dates au format JJ/MM/AAAA. L'adresse remplace le champ "
-    "« adresse des travaux » d'Odicee dans son intégralité (code postal/ville restent séparés "
-    "et ne sont pas modifiables ici)."
-)
-if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisation.get("fileName"):
-    st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
-if avertissement_installateur:
-    st.warning(avertissement_installateur)
-
-for i, label in enumerate(df_identite_edite["Champ"]):
-    valeur_orig = lignes_html[i][2]
-    valeur_editee = df_identite_edite["Odicee"].iloc[i]
-    if str(valeur_editee) == str(valeur_orig):
-        continue
-    if label == "Date d'engagement":
-        ts = date_str_vers_ts_ms(valeur_editee)
-        if ts is not None:
-            data["dateEngagementReelle"] = ts
-            modifications_odicee.append((fiche_odicee_match, "dateEngagementReelle", valeur_orig, valeur_editee))
-        else:
-            st.warning(f"Date d'engagement « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
-    elif label == "Date de réalisation":
-        ts = date_str_vers_ts_ms(valeur_editee)
-        if ts is not None:
-            data["dateRealisationReelle"] = ts
-            modifications_odicee.append((fiche_odicee_match, "dateRealisationReelle", valeur_orig, valeur_editee))
-        else:
-            st.warning(f"Date de réalisation « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
-    elif label == "Adresse des travaux":
-        fd["adresse_travaux"] = valeur_editee
-        modifications_odicee.append((fiche_odicee_match, "adresse_travaux", valeur_orig, valeur_editee))
-    elif label == "SIRET professionnel":
-        titulaire["siret"] = valeur_editee
-        modifications_odicee.append((fiche_odicee_match, "professionnelTitulaireSigneQualite.siret", valeur_orig, valeur_editee))
-    elif label == "SIRET sous-traitant":
-        st_dict = lot.setdefault("professionnelSousTraitant", {})
-        st_dict["siret"] = valeur_editee
-        modifications_odicee.append((fiche_odicee_match, "professionnelSousTraitant.siret", valeur_orig, valeur_editee))
-
-# ── Comparaison technique champ par champ ──
-st.markdown("#### 🔧 Données techniques")
-
-ref_upper = fiche_odicee_match.upper()
-export_technique = None  # rempli par chaque branche ci-dessous, utilisé pour l'export Excel
-
-if "BAR-TH-106" in ref_upper:
-    lignes_th106, note_th106, editable_th106 = comparer_th106(fd, report)
-    if note_th106:
-        st.info(note_th106)
-    docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc_alias(report, dt)]
-    entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
-    lignes = {c: [] for c in entete}
-    cles_ecriture_th106 = []
-    for label, valeur_od, valeurs_pr, cle_ecriture in lignes_th106:
-        # Le badge de statut ne reflète que l'écart Odicee <-> Facture ; l'AH n'est qu'une
-        # information affichée en plus, elle ne doit pas influencer la conclusion (déclaration
-        # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
-        statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
-        lignes[""].append(badge(statut_badge))
-        lignes["Champ"].append(label)
-        lignes["Odicee"].append(f"{valeur_od}" if valeur_od not in (None, "") else "—")
-        for dt in docs_presents:
-            v = valeurs_pr.get(dt)
-            lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
-        cles_ecriture_th106.append(cle_ecriture)
-
-    if editable_th106:
-        df_th106 = pd.DataFrame(lignes)
-        colonnes_verrouillees_th106 = [c for c in df_th106.columns if c != "Odicee"]
-        df_th106_edite = st.data_editor(
-            df_th106,
-            disabled=colonnes_verrouillees_th106,
-            column_config={"Odicee": st.column_config.TextColumn("Odicee ✏️")},
-            hide_index=True,
-            key=f"editeur_th106_{fiche_odicee_match}_{adresse_site}",
-        )
-        st.caption(
-            "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
-            "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
-            "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain). "
-            "✏️ Colonne Odicee modifiable, sauf marque/référence chaudière et classe régulateur "
-            "(champs composites/à liste déroulante, non réinjectables tels quels ici)."
-        )
-        for i, cle_ecriture in enumerate(cles_ecriture_th106):
-            if not cle_ecriture:
-                continue
-            valeur_orig_affichee = lignes["Odicee"][i]
-            valeur_editee = df_th106_edite["Odicee"].iloc[i]
-            if str(valeur_editee) != str(valeur_orig_affichee):
-                fd[cle_ecriture] = caster_comme_original(fd.get(cle_ecriture), valeur_editee)
-                modifications_odicee.append((fiche_odicee_match, cle_ecriture, valeur_orig_affichee, valeur_editee))
-        export_technique = {"type": "table", "titre": "Données techniques", "df": df_th106_edite}
-    else:
-        st.table(lignes)
-        st.caption(
-            "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
-            "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
-            "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain). "
-            "Tableau non modifiable ici (cas « collectif », structure multi-chaudières)."
-        )
-        export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
-
-elif "BAR-TH-158" in ref_upper:
-    odicee_rows, presta_rows, total_od, total_pr = comparer_th158(fd, report)
-    statut_total, detail_total = comparer(total_od, total_pr, tolerance=0)
-    st.markdown(
-        f"{badge(statut_total)} **Total quantité émetteurs** — Odicee : {total_od:g} · "
-        f"Prestataire (somme des factures) : {total_pr:g}"
-    )
-    if statut_total != "ok":
-        st.caption(detail_total or "")
-    st.caption(
-        "Pas de correspondance ligne-à-ligne automatique (l'ordre des lignes n'est pas garanti) — "
-        "rapprochez visuellement marque/référence/quantité entre les deux tableaux ci-dessous."
-    )
-    col_od, col_pr = st.columns(2)
-    with col_od:
-        st.markdown("**Odicee — tableau Equipements ✏️**")
-        try:
-            if odicee_rows:
-                df_od_th158 = st.data_editor(
-                    pd.DataFrame(odicee_rows),
-                    hide_index=True,
-                    key=f"editeur_th158_{fiche_odicee_match}_{adresse_site}",
-                )
-                lignes_modifiees = df_od_th158.to_dict("records") != odicee_rows
-                if lignes_modifiees and isinstance(fd.get("Equipements"), dict):
-                    nouvelles_lignes = []
-                    for r in df_od_th158.to_dict("records"):
-                        qte = caster_comme_original(1, r.get("Quantité", ""))
-                        puissance = caster_comme_original(1, r.get("Puissance (W)", ""))
-                        nouvelles_lignes.append([
-                            r.get("Marque", ""), r.get("Référence", ""), r.get("N° certif NF", ""),
-                            qte, puissance,
-                        ])
-                    fd["Equipements"]["values"] = json.dumps(nouvelles_lignes, ensure_ascii=False)
-                    modifications_odicee.append(
-                        (fiche_odicee_match, "Equipements", odicee_rows, df_od_th158.to_dict("records"))
-                    )
-                    # Recalcule le total affiché plus haut avec les nouvelles quantités
-                    total_od = sum(normalise_nombre(r.get("Quantité")) or 0 for r in df_od_th158.to_dict("records"))
-                odicee_rows = df_od_th158.to_dict("records")
-            else:
-                st.caption("Aucune ligne.")
-        except Exception as e:
-            st.error(f"Affichage impossible pour ce tableau ({e}).")
-            st.write(odicee_rows)
-    with col_pr:
-        st.markdown("**Prestataire — factures**")
-        try:
-            if presta_rows:
-                st.table(presta_rows)
-            else:
-                st.caption("Aucune ligne.")
-        except Exception as e:
-            st.error(f"Affichage impossible pour ce tableau ({e}).")
-            st.write(presta_rows)
-    export_technique = {
-        "type": "th158",
-        "titre": "Equipements",
-        "odicee_df": pd.DataFrame(odicee_rows),
-        "presta_df": pd.DataFrame(presta_rows),
-        "total_odicee": total_od,
-        "total_presta": total_pr,
-    }
-
-else:
-    if "BAR-EN-104" in ref_upper:
-        regles_fiche = champs_en104(data.get("dateEngagementReelle"))
-    else:
-        regles_fiche = REGLES.get(fiche_odicee_match) or next(
-            (v for k, v in REGLES.items() if k in ref_upper), None
-        )
-
-    mapping_fiche = FIELD_MAPPING.get(fiche_odicee_match) or next(
-        (v for k, v in FIELD_MAPPING.items() if k in ref_upper), None
-    )
-
-    if not mapping_fiche:
-        st.warning(
-            f"Aucun mapping de champs défini pour **{fiche_odicee_match}** vers le format prestataire. "
-            "Ajoutez-le dans FIELD_MAPPING une fois un JSON prestataire réel disponible pour cette fiche."
-        )
-    elif not regles_fiche:
-        st.warning(f"Fiche **{fiche_odicee_match}** absente de REGLES (utils_supervision.py).")
-    else:
-        docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc_alias(report, dt)]
-        if not docs_presents:
-            st.warning("Aucun document AH/Facture exploitable dans le JSON prestataire.")
-        else:
-            entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
-            lignes = {c: [] for c in entete}
-            # Parallèle à `lignes` : clé formData brute et indicateur "champ encodé" (valeur
-            # affichée décodée par decoder_valeur, ex: type de pose 0/1 -> texte) pour chaque
-            # ligne éditable — on ne permet pas la modification des champs encodés ici, le
-            # risque de réinjecter un texte au lieu du code numérique attendu par Odicee est
-            # trop élevé pour un simple champ texte.
-            cles_od_lignes = []
-            encode_lignes = []
-
-            for cle_od, label, unite, critique in regles_fiche:
-                if cle_od not in mapping_fiche:
-                    continue
-                cle_pr = mapping_fiche[cle_od]
-
-                # Champ cumulable (ex: surface) sur une fiche à plusieurs lots (plusieurs
-                # bâtiments d'un même complexe) : la facture prestataire donne souvent un total
-                # combiné plutôt qu'un chiffre par bâtiment — on doit alors sommer Odicee sur
-                # tous les lots de la fiche pour comparer des totaux équivalents, sinon chaque
-                # lot ressort systématiquement en faux écart net face au total facturé.
-                est_cumule = False
-                if cle_od in CHAMPS_CUMULABLES and len(lots_sites) > 1:
-                    valeurs_lots = [normalise_nombre(l.get("formData", {}).get(cle_od)) for l, _ in lots_sites]
-                    if all(v is not None for v in valeurs_lots):
-                        valeur_od = sum(valeurs_lots)
-                        valeur_od_dec = valeur_od
-                        est_cumule = True
-                if not est_cumule:
-                    valeur_od = fd.get(cle_od)
-                    valeur_od_dec = decoder_valeur(fiche_odicee_match, cle_od, valeur_od)
-
-                valeurs_pr = {}
-                for dt in docs_presents:
-                    v, _fname = get_presta_technical_value(report, dt, cle_pr)
-                    valeurs_pr[dt] = v
-
-                # Statut du badge = comparaison Odicee <-> Facture uniquement ; l'AH reste
-                # affichée à titre d'information mais n'influence pas la conclusion (déclaration
-                # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
-                statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
-
-                lignes[""].append(badge(statut_badge))
-                lignes["Champ"].append(
-                    f"{label}" + (f" ({unite})" if unite else "")
-                    + (" [cumulé, tous lots]" if est_cumule else "")
-                )
-                lignes["Odicee"].append(
-                    f"{valeur_od_dec}" if valeur_od_dec not in (None, "") else "—"
-                )
-                for dt in docs_presents:
-                    v = valeurs_pr[dt]
-                    lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
-
-                cles_od_lignes.append(cle_od)
-                # Un total cumulé ne se réinjecte pas proprement dans le formData d'un seul lot :
-                # non éditable, comme les champs encodés (même mécanisme de verrouillage).
-                encode_lignes.append(est_cumule or str(valeur_od_dec) != str(valeur_od))
-
-            if lignes["Champ"]:
-                df_lignes = pd.DataFrame(lignes)
-                colonnes_verrouillees = [c for c in df_lignes.columns if c != "Odicee"]
-                # Les champs encodés (liste déroulante Odicee ex: type de pose) restent en
-                # lecture seule : data_editor ne permet pas de désactiver une cellule isolée.
-                df_lignes["_editable"] = [not e for e in encode_lignes]
-
-                df_edite = st.data_editor(
-                    df_lignes.drop(columns=["_editable"]),
-                    disabled=colonnes_verrouillees + (["Odicee"] if all(encode_lignes) else []),
-                    column_config={
-                        "Odicee": st.column_config.TextColumn(
-                            "Odicee ✏️" if not all(encode_lignes) else "Odicee"
-                        )
-                    },
-                    hide_index=True,
-                    key=f"editeur_technique_{fiche_odicee_match}_{adresse_site}",
-                )
                 st.caption(
-                    "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle (à vérifier "
-                    "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés — "
-                    "comparaison Odicee vs Facture uniquement (l'AH est affichée à titre informatif et "
-                    "n'influence pas la couleur). "
-                    "✏️ Colonne Odicee modifiable (les champs à liste déroulante — type de pose, "
-                    "classe de régulateur... — restent en lecture seule ici)."
+                    "Pour retester ce dossier : le comparatif ci-dessus reflète la dernière analyse "
+                    "connue — déposez juste le **nouveau** JSON prestataire ci-dessous, il remplace "
+                    "automatiquement la version chargée pour cette comparaison (et s'ajoute à l'historique)."
                 )
+        except Exception as _e_recherche:
+            st.error(
+                f"⚠️ La recherche de dossiers enregistrés a rencontré un problème et a été "
+                f"désactivée pour cette page (l'upload manuel ci-dessous reste disponible) : {_e_recherche}"
+            )
+            st.session_state.pop("recherche_numero_unifiee", None)
 
-                for i, cle_od in enumerate(cles_od_lignes):
-                    if encode_lignes[i]:
-                        continue
-                    valeur_originale = fd.get(cle_od)
-                    valeur_affichee_orig = lignes["Odicee"][i]
-                    valeur_editee = df_edite["Odicee"].iloc[i]
-                    if str(valeur_editee) != str(valeur_affichee_orig):
-                        fd[cle_od] = caster_comme_original(valeur_originale, valeur_editee)
-                        modifications_odicee.append((fiche_odicee_match, cle_od, valeur_affichee_orig, valeur_editee))
+        st.markdown("---")
 
-                export_technique = {"type": "table", "titre": "Données techniques", "df": df_edite}
-            else:
-                st.caption("Aucun champ mappé n'a de correspondance exploitable.")
+    col_up1, col_up2 = st.columns(2)
+    with col_up1:
+        fichier_odicee = st.file_uploader("JSON Odicee (dossier)", type="json", key="odicee")
+    with col_up2:
+        fichier_presta = st.file_uploader("JSON Prestataire (rapport d'analyse)", type="json", key="presta")
 
+    if not (fichier_odicee or data_rechargee) or not (fichier_presta or presta_rechargee):
+        st.info(
+            "Chargez le JSON Odicee et le JSON prestataire (ou recherchez un dossier déjà "
+            "enregistré ci-dessus) pour lancer la comparaison."
+        )
+        st.stop()
 
-# ── Règles de conformité déjà calculées par le prestataire (pour contexte) ──
-with st.expander("📜 Règles de conformité du prestataire (pour information)"):
-    # Les règles "bloquantes" (NonCompliant, ex: RGE, ancienneté de la facture) sont souvent
-    # rattachées à un document précis (documents[].rules[]) plutôt qu'aux règles globales du
-    # dossier (globalRules) — les deux sources sont agrégées ici pour ne rien manquer, comme
-    # le fait l'outil du prestataire lui-même ("Dossier non éligible" + "Anomalies à corriger").
-    non_conformes = []
-    for r in report.get("globalRules", []) or []:
-        if r.get("status") != "Compliant":
-            non_conformes.append(r)
-    for doc in report.get("documents", []) or []:
-        for r in doc.get("rules", []) or []:
-            if r.get("status") != "Compliant":
-                r = dict(r)
-                r.setdefault("documentRef", doc.get("fileName"))
-                non_conformes.append(r)
-
-    if non_conformes:
-        bloquantes = [r for r in non_conformes if r.get("status") == "NonCompliant"]
-        a_verifier = [r for r in non_conformes if r.get("status") != "NonCompliant"]
-        if bloquantes:
-            st.markdown("**🔴 Dossier non éligible**")
-            for r in bloquantes:
-                source = f" *(source : {r['documentRef']})*" if r.get("documentRef") else ""
-                st.markdown(f"🔴 **{r.get('ruleId')}** — {r.get('message')}{source}")
-        if a_verifier:
-            st.markdown("**🟡 Anomalies à corriger**")
-            for r in a_verifier:
-                source = f" *(source : {r['documentRef']})*" if r.get("documentRef") else ""
-                st.markdown(f"🟡 **{r.get('ruleId')}** — {r.get('message')}{source}")
+    if fichier_odicee:
+        try:
+            data = json.load(fichier_odicee)
+        except Exception as e:
+            st.error(f"JSON Odicee invalide : {e}")
+            st.stop()
     else:
-        st.caption("Aucune non-conformité signalée par le prestataire.")
+        data = data_rechargee
 
+    if fichier_presta:
+        try:
+            presta = json.load(fichier_presta)
+        except Exception as e:
+            st.error(f"JSON Prestataire invalide : {e}")
+            st.stop()
+    else:
+        presta = presta_rechargee
 
-# ─────────────────────────────────────────────
-# EXPORT DU RAPPORT (Excel)
-# ─────────────────────────────────────────────
+    report = presta.get("report") or {}
+    documents_presta = report.get("documents", []) or []
+    fiche_presta = str(report.get("barReference", "")).upper()
+    filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or "")
+    # Le prestataire n'inclut pas toujours le préfixe "T" (ex: "176444" au lieu de "T176444") et
+    # ajoute parfois un suffixe de version (ex: "T155418 V2") — normalisation vers la même clé
+    # canonique que côté Odicee, pour que les deux se retrouvent dans le même historique.
+    numero_dossier_presta = normaliser_numero_dossier(filenumber_presta)
 
-def construire_rapport_excel():
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        # ── Feuille unique "Comparaison" : identité dossier + administratif + technique ──
-        df_admin = pd.DataFrame(
-            [{"Champ": "Site", "Odicee": adresse_site, "Prestataire": "", "Détail écart": ""}]
-            + [
-                {"Champ": label, "Odicee": v_od, "Prestataire": v_pr, "Détail écart": detail}
-                for _, label, v_od, v_pr, detail in lignes_html
-            ]
+    cle_session_presta = f"_presta_deja_sauvegarde_{getattr(fichier_presta, 'file_id', None) or (fichier_presta.name if fichier_presta else None)}"
+    if fichier_presta and filenumber_presta and not st.session_state.get(cle_session_presta):
+        # Sauvegarde dans Supabase une seule fois par fichier réellement uploadé — pas à chaque
+        # interaction/rerun de la page (ex: ajouter un commentaire), sinon chaque clic redéclenche
+        # un aller-retour réseau inutile (vérification anti-doublon + insertion).
+        ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, numero_dossier_presta, fiche_presta)
+        if ok_presta and msg_presta == "identique":
+            st.toast(f"ℹ️ Identique à la dernière version enregistrée pour {numero_dossier_presta} — pas de doublon créé.", icon="ℹ️")
+            lister_toutes_analyses_prestataire.clear()
+        elif ok_presta:
+            st.toast(f"✅ Analyse prestataire {filenumber_presta} enregistrée dans l'historique.", icon="💾")
+            lister_toutes_analyses_prestataire.clear()
+            lister_historique_prestataire.clear()
+            lister_tous_numeros_connus.clear()
+        else:
+            st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
+        if ok_presta and supabase_ok:
+            # Retrouve l'id Supabase de cette analyse (celle qu'on vient d'insérer, ou celle déjà
+            # identique) pour pouvoir y rattacher des commentaires — mémorisé pour ne pas avoir à
+            # requêter Supabase de nouveau à chaque rerun tant que c'est le même fichier.
+            _historique_maj = lister_historique_prestataire(numero_dossier_presta)
+            if _historique_maj:
+                id_analyse_active = _historique_maj[0]["id"]
+                st.session_state["_id_analyse_active_courante"] = id_analyse_active
+        st.session_state[cle_session_presta] = True
+    elif fichier_presta and st.session_state.get("_id_analyse_active_courante"):
+        id_analyse_active = st.session_state["_id_analyse_active_courante"]
+
+    # ── Vérification d'identité dossier ──
+    st.markdown("### 🪪 Identification du dossier")
+    dossier_id = str(data.get("id", ""))
+    prefixe = data.get("prefixe", "") or ""
+    id_odicee = f"{prefixe}{dossier_id}"
+    id_presta_clean = re.sub(r"^\D+", "", filenumber_presta)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("N° dossier Odicee", id_odicee)
+    c2.metric("N° dossier Prestataire", filenumber_presta or "—")
+    match_id = dossier_id == id_presta_clean
+    c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart — vérifier le rapprochement'}")
+
+    if dossier_id:
+        url_odicee = f"https://odicee.edf.fr/api/dossiers/{dossier_id}"
+        url_odicee_appli = f"https://odicee.edf.fr/dossiers/{dossier_id}"
+        liens = [
+            f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>',
+            f'<a href="{url_odicee_appli}" target="_blank">🔗 Ouvrir le dossier Odicee</a>',
+        ]
+        id_technique_presta = presta.get("id")
+        if id_technique_presta:
+            url_presta = f"https://docminddev.promotelec-services.com/api/dossiers/{id_technique_presta}"
+            url_presta_appli = f"https://docminddev.promotelec-services.com/dossier/{id_technique_presta}"
+            liens.append(f'<a href="{url_presta}" target="_blank">🔗 Ouvrir le JSON Prestataire (API)</a>')
+            liens.append(f'<a href="{url_presta_appli}" target="_blank">🔗 Ouvrir le dossier Prestataire</a>')
+        st.markdown("&nbsp;&nbsp;·&nbsp;&nbsp;".join(liens), unsafe_allow_html=True)
+
+    if not match_id:
+        st.warning(
+            "⚠️ Le numéro de dossier du rapport prestataire ne correspond pas au JSON Odicee chargé. "
+            "Vérifiez que vous comparez bien le même dossier avant d'interpréter les écarts ci-dessous."
         )
 
-        ligne_courante = 0
-        feuille = "Comparaison"
-        pd.DataFrame(
-            [{"Dossier": f"{id_odicee} (Odicee) / {filenumber_presta} (Prestataire)", "Fiche": fiche_odicee_match}]
-        ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-        ligne_courante += 3
-
-        df_admin.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-        ligne_courante += len(df_admin) + 3
-
-        if export_technique:
-            if export_technique["type"] == "table":
-                pd.DataFrame([{"Champ": "── Données techniques ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                export_technique["df"].to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-                ligne_courante += len(export_technique["df"])
-            elif export_technique["type"] == "th158":
-                pd.DataFrame([{"Champ": "── Equipements Odicee ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                export_technique["odicee_df"].to_excel(
-                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
-                )
-                ligne_courante += len(export_technique["odicee_df"]) + 3
-
-                pd.DataFrame([{"Champ": "── Equipements Prestataire ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                export_technique["presta_df"].to_excel(
-                    writer, sheet_name=feuille, index=False, startrow=ligne_courante
-                )
-                ligne_courante += len(export_technique["presta_df"]) + 3
-
-                pd.DataFrame(
+    # ── Historique des analyses prestataire pour ce dossier ──
+    if SUPABASE_DISPONIBLE and get_supabase_client() and filenumber_presta:
+        historique = lister_historique_prestataire(filenumber_presta)
+        if len(historique) > 1:
+            with st.expander(f"🕓 Historique des analyses prestataire pour {filenumber_presta} ({len(historique)} versions)"):
+                df_hist = pd.DataFrame([
                     {
-                        "Total": ["Odicee", "Prestataire"],
-                        "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
+                        "Date d'analyse": (h.get("date_analyse") or h.get("date_ajout") or "")[:19].replace("T", " "),
+                        "Fiabilité": f"{h['reliability_score']*100:.0f}%" if h.get("reliability_score") is not None else "—",
+                        "Statut global": h.get("overall_status") or "—",
                     }
-                ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
-            ligne_courante += 6
-
-        # ── Commentaires (visuel des problèmes / évolution), en bas du tableau de comparaison ──
-        if supabase_ok:
-            commentaires_export = lister_commentaires(normaliser_numero_dossier(id_odicee))
-            if commentaires_export:
-                pd.DataFrame([{"Champ": "── Commentaires ──"}]).to_excel(
-                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
-                )
-                ligne_courante += 1
-                df_commentaires = pd.DataFrame([
-                    {
-                        "Date": (c.get("date_ajout") or "")[:10],
-                        "Analyse liée": (
-                            "analyse du " + ((c.get("dossiers_prestataire") or {}).get("date_analyse")
-                                              or (c.get("dossiers_prestataire") or {}).get("date_ajout") or "?")[:10]
-                            if c.get("dossiers_prestataire") else "non identifiée"
-                        ),
-                        "Commentaire": c["commentaire"],
-                    }
-                    for c in commentaires_export
+                    for h in historique
                 ])
-                df_commentaires.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+                st.table(df_hist)
 
-        df_regles = pd.DataFrame(
-            [
-                {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message"),
-                 "Document source": r.get("documentRef") or ""}
-                for r in non_conformes
-            ]
-        ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message", "Document source"])
-        df_regles.to_excel(writer, sheet_name="Non-conformités prestataire", index=False)
+                versions_labels = [
+                    f"{(h.get('date_analyse') or h.get('date_ajout') or '')[:19].replace('T', ' ')} "
+                    f"(fiabilité {h['reliability_score']*100:.0f}%)" if h.get("reliability_score") is not None
+                    else (h.get("date_analyse") or h.get("date_ajout") or "")[:19].replace("T", " ")
+                    for h in historique
+                ]
+                choix_ancien = st.selectbox(
+                    "Comparer la version actuelle à une version antérieure :",
+                    ["—"] + versions_labels[1:],  # la plus récente (index 0) = celle chargée maintenant
+                )
+                if choix_ancien != "—":
+                    idx_choisi = versions_labels.index(choix_ancien)
+                    ancien_presta, erreur_ancien = charger_analyse_prestataire(historique[idx_choisi]["id"])
+                    if erreur_ancien:
+                        st.error(f"⚠️ Échec du rechargement de cette version : {erreur_ancien}")
+                    elif ancien_presta:
+                        diff = comparer_deux_analyses_prestataire(ancien_presta, presta)
+                        diff_changes = [d for d in diff if d[3]]
+                        if diff_changes:
+                            st.markdown(f"**{len(diff_changes)} champ(s) modifié(s) depuis cette version :**")
+                            st.table(pd.DataFrame(
+                                [{"Champ": c, "Ancienne valeur": va, "Nouvelle valeur": vn} for c, va, vn, _ in diff_changes]
+                            ))
+                        else:
+                            st.caption("Aucune différence détectée sur les champs techniques extraits entre ces deux versions.")
 
-    return buffer.getvalue()
-
-
-colex1, colex2 = st.columns(2)
-with colex1:
-    st.download_button(
-        "📥 Télécharger le rapport (Excel)",
-        data=construire_rapport_excel(),
-        file_name=f"{datetime.now().strftime('%Y-%m-%d')}_{id_odicee}_{fiche_odicee_match}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-with colex2:
-    if modifications_odicee:
-        cdl1, cdl2 = st.columns(2)
-        with cdl1:
-            st.download_button(
-                "📥 Télécharger le JSON modifié",
-                data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
-                file_name=f"{id_odicee}_modifie.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-        with cdl2:
-            if supabase_ok:
-                if st.button("💾 Mettre à jour dans Supabase", use_container_width=True):
-                    ok_maj, msg_maj = sauvegarder_dossier_odicee(data, fiche=fiche_odicee_match)
-                    if ok_maj:
-                        lister_dossiers_odicee.clear()
-                        lister_tous_numeros_connus.clear()
-                        st.success(f"✅ Dossier Odicee {id_odicee} mis à jour dans Supabase avec les modifications.")
-                    else:
-                        st.error(f"⚠️ Échec de la mise à jour : {msg_maj}")
-    else:
-        st.caption("Aucune modification apportée aux valeurs Odicee — rien à réexporter en JSON.")
-
-if modifications_odicee:
-    with st.expander(f"✏️ {len(modifications_odicee)} modification(s) apportée(s) aux valeurs Odicee"):
-        for fiche_mod, cle_mod, avant, apres in modifications_odicee:
-            st.caption(f"**{cle_mod}** ({fiche_mod}) : {avant} → {apres}")
-
-
-# ─────────────────────────────────────────────
-# COMMENTAIRES (visuel des problèmes + évolution, par dossier et par version prestataire)
-# ─────────────────────────────────────────────
-
-commentaires_dossier = []
-if supabase_ok:
     st.markdown("---")
-    st.markdown("## 💬 Commentaires")
 
-    numero_pour_commentaire = normaliser_numero_dossier(id_odicee)
-    nouveau_commentaire = st.text_area(
-        "Ajouter un commentaire sur ce dossier",
-        placeholder="Ex: écart de surface non résolu, à relancer côté prestataire...",
-        key="nouveau_commentaire",
-    )
-    if st.button("💬 Ajouter le commentaire"):
-        ok_com, msg_com = ajouter_commentaire(numero_pour_commentaire, id_analyse_active, nouveau_commentaire)
-        if ok_com:
-            lister_commentaires.clear()
-            st.success("Commentaire ajouté.")
+    # ── Sélection du lot Odicee correspondant à la fiche du rapport prestataire ──
+    lots_par_fiche = get_odicee_lots_bar(data)
+    fiche_odicee_match = next((f for f in lots_par_fiche if f.upper() == fiche_presta), None)
+
+    cle_session_odicee = f"_odicee_deja_sauvegarde_{getattr(fichier_odicee, 'file_id', None) or (fichier_odicee.name if fichier_odicee else None)}"
+    if fichier_odicee and lots_par_fiche and not st.session_state.get(cle_session_odicee):
+        # Sauvegarde dans Supabase une seule fois par fichier réellement uploadé (upsert : écrase
+        # la version précédente du même dossier) — pas à chaque interaction/rerun de la page (ex:
+        # ajouter un commentaire), sinon chaque clic redéclenche un aller-retour réseau inutile.
+        ok_odicee, msg_odicee = sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
+        st.session_state[cle_session_odicee] = True
+        if ok_odicee:
+            st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
+            lister_dossiers_odicee.clear()
+            lister_tous_numeros_connus.clear()
         else:
-            st.error(f"⚠️ {msg_com}")
+            st.warning(f"⚠️ Échec de l'enregistrement du dossier Odicee dans Supabase : {msg_odicee}")
 
-    commentaires_dossier = lister_commentaires(numero_pour_commentaire)
-    if commentaires_dossier:
-        with st.expander(f"🗂️ {len(commentaires_dossier)} commentaire(s) enregistré(s) pour ce dossier", expanded=True):
-            for c in commentaires_dossier:
+    if not fiche_odicee_match:
+        st.error(
+            f"Aucun lot Odicee avec la fiche **{fiche_presta or '—'}** trouvé dans ce dossier. "
+            f"Fiches disponibles côté Odicee : {', '.join(lots_par_fiche) or '—'}."
+        )
+        st.stop()
+
+    if supabase_ok and id_analyse_active:
+        cle_session_fiabilite = f"_fiabilite_calculee_{id_analyse_active}"
+        if not st.session_state.get(cle_session_fiabilite):
+            resume_fiabilite = calculer_fiabilite(data, presta)
+            if resume_fiabilite:
+                enregistrer_fiabilite(id_analyse_active, resume_fiabilite)
+            st.session_state[cle_session_fiabilite] = True
+
+    lots_sites = lots_par_fiche[fiche_odicee_match]
+    if len(lots_sites) > 1:
+        adresses = [a for _, a in lots_sites]
+        choix = st.selectbox("Plusieurs sites pour cette fiche — choisir celui à comparer :", adresses)
+        lot, adresse_site = next((l, a) for l, a in lots_sites if a == choix)
+    else:
+        lot, adresse_site = lots_sites[0]
+
+    fd = lot.get("formData", {}) or {}
+
+    st.markdown(f"### 📋 Fiche comparée : **{fiche_odicee_match}** — {adresse_site}")
+
+    # ── Comparaison des dates & identité chantier (niveau dossier) ──
+    st.markdown("#### 📅 Dates & identité chantier")
+    doc_engagement = (
+        get_presta_doc_par_regle(report, "DOSSIER_HAS_ENGAGEMENT")
+        or get_presta_doc(report, "EngagementAct")
+        or get_presta_doc(report, "PurchaseOrder")
+        or get_presta_doc(report, "ServiceOrder")
+        or get_presta_doc(report, "LetterOfCommand")
+        # "Quote" (devis) n'est pas idéal comme preuve d'engagement (c'est une offre, pas un accord
+        # signé) mais certains dossiers n'ont que ça — mieux vaut l'utiliser en dernier recours que
+        # de ne rien détecter du tout.
+        or get_presta_doc(report, "Quote")
+    )
+    doc_realisation = (
+        get_presta_doc_par_regle(report, "DOSSIER_HAS_COMPLETION")
+        or get_presta_doc_alias(report, "Invoice")
+    )
+
+    rows_identite = []
+    modifications_odicee = []  # (fiche, cle_od, ancienne_valeur, nouvelle_valeur) — édité par l'utilisateur
+
+    date_eng_odicee = fmt_ts(data.get("dateEngagementReelle"))
+    date_eng_presta = (doc_engagement or {}).get("extractedFields", {}).get("documentDate") or \
+                       (doc_engagement or {}).get("extractedFields", {}).get("signatureDate")
+    rows_identite.append(("Date d'engagement", date_eng_odicee, fmt_date_any(date_eng_presta)))
+
+    date_real_odicee = fmt_ts(data.get("dateRealisationReelle"))
+    date_real_presta = (doc_realisation or {}).get("extractedFields", {}).get("documentDate")
+    rows_identite.append(("Date de réalisation", date_real_odicee, fmt_date_any(date_real_presta)))
+
+    adresse_fd = " ".join(filter(None, [
+        fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
+    ])) or None
+    adresse_presta, doc_adresse_presta = get_presta_works_address(report, doc_realisation, doc_engagement)
+    rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
+
+    prof = lot.setdefault("professionnel", {})  # référence réelle dans `lot`/`data`, pas une copie
+    # `professionnel` est tantôt le maître d'œuvre, tantôt un mandataire/apporteur d'affaire — jamais
+    # fiable à l'aveugle. Le SIRET à comparer aux documents prestataire (facture/RGE) est celui du
+    # professionnel ayant réellement réalisé les travaux : voir trouver_professionnel_installateur(),
+    # qui confronte chaque candidat Odicee au SIRET de la facture pour lever l'ambiguïté.
+    siret_presta = (doc_realisation or {}).get("extractedFields", {}).get("siret")
+    titulaire, avertissement_installateur = trouver_professionnel_installateur(data, lot, siret_presta)
+    siret_odicee = titulaire.get("siret")
+    rows_identite.append(("SIRET professionnel", siret_odicee, siret_presta))
+
+    # Sous-traitant : n'affiché que si au moins un côté en a un (dossier avec DC4 / RGE distinct
+    # du titulaire), pour ne pas ajouter une ligne "—/—" sur les dossiers sans sous-traitance.
+    sous_traitant_od = lot.get("professionnelSousTraitant")
+    sous_traitant_od = sous_traitant_od if isinstance(sous_traitant_od, dict) else {}
+    siret_sous_traitant_od = sous_traitant_od.get("siret")
+
+    doc_rge = get_presta_doc(report, "RgeCertificate")
+    siret_rge = (doc_rge or {}).get("extractedFields", {}).get("siret")
+    # Le RGE n'est un "sous-traitant côté prestataire" que s'il diffère du titulaire (sinon c'est
+    # simplement le certificat RGE du titulaire lui-même, rien d'anormal).
+    siret_sous_traitant_presta = siret_rge if (siret_rge and siret_rge != siret_odicee) else None
+
+    if siret_sous_traitant_od or siret_sous_traitant_presta:
+        rows_identite.append(("SIRET sous-traitant", siret_sous_traitant_od, siret_sous_traitant_presta))
+
+    lignes_html = []
+    for label, v_od, v_pr in rows_identite:
+        statut, detail = comparer(v_od, v_pr, tolerance=0)
+        lignes_html.append((badge(statut), label, f"{v_od}" if v_od else "—", f"{v_pr}" if v_pr else "—", detail or ""))
+
+    df_identite = pd.DataFrame(
+        {
+            "": [l[0] for l in lignes_html],
+            "Champ": [l[1] for l in lignes_html],
+            "Odicee": [l[2] for l in lignes_html],
+            "Prestataire": [l[3] for l in lignes_html],
+            "Détail écart": [l[4] for l in lignes_html],
+        }
+    )
+    df_identite_edite = st.data_editor(
+        df_identite,
+        disabled=["", "Champ", "Prestataire", "Détail écart"],
+        column_config={"Odicee": st.column_config.TextColumn("Odicee ✏️")},
+        hide_index=True,
+        key=f"editeur_identite_{fiche_odicee_match}_{adresse_site}",
+    )
+    st.caption(
+        "✏️ Colonne Odicee modifiable. Dates au format JJ/MM/AAAA. L'adresse remplace le champ "
+        "« adresse des travaux » d'Odicee dans son intégralité (code postal/ville restent séparés "
+        "et ne sont pas modifiables ici)."
+    )
+    if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisation.get("fileName"):
+        st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
+    if avertissement_installateur:
+        st.warning(avertissement_installateur)
+
+    for i, label in enumerate(df_identite_edite["Champ"]):
+        valeur_orig = lignes_html[i][2]
+        valeur_editee = df_identite_edite["Odicee"].iloc[i]
+        if str(valeur_editee) == str(valeur_orig):
+            continue
+        if label == "Date d'engagement":
+            ts = date_str_vers_ts_ms(valeur_editee)
+            if ts is not None:
+                data["dateEngagementReelle"] = ts
+                modifications_odicee.append((fiche_odicee_match, "dateEngagementReelle", valeur_orig, valeur_editee))
+            else:
+                st.warning(f"Date d'engagement « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
+        elif label == "Date de réalisation":
+            ts = date_str_vers_ts_ms(valeur_editee)
+            if ts is not None:
+                data["dateRealisationReelle"] = ts
+                modifications_odicee.append((fiche_odicee_match, "dateRealisationReelle", valeur_orig, valeur_editee))
+            else:
+                st.warning(f"Date de réalisation « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
+        elif label == "Adresse des travaux":
+            fd["adresse_travaux"] = valeur_editee
+            modifications_odicee.append((fiche_odicee_match, "adresse_travaux", valeur_orig, valeur_editee))
+        elif label == "SIRET professionnel":
+            titulaire["siret"] = valeur_editee
+            modifications_odicee.append((fiche_odicee_match, "professionnelTitulaireSigneQualite.siret", valeur_orig, valeur_editee))
+        elif label == "SIRET sous-traitant":
+            st_dict = lot.setdefault("professionnelSousTraitant", {})
+            st_dict["siret"] = valeur_editee
+            modifications_odicee.append((fiche_odicee_match, "professionnelSousTraitant.siret", valeur_orig, valeur_editee))
+
+    # ── Comparaison technique champ par champ ──
+    st.markdown("#### 🔧 Données techniques")
+
+    ref_upper = fiche_odicee_match.upper()
+    export_technique = None  # rempli par chaque branche ci-dessous, utilisé pour l'export Excel
+
+    if "BAR-TH-106" in ref_upper:
+        lignes_th106, note_th106, editable_th106 = comparer_th106(fd, report)
+        if note_th106:
+            st.info(note_th106)
+        docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc_alias(report, dt)]
+        entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
+        lignes = {c: [] for c in entete}
+        cles_ecriture_th106 = []
+        for label, valeur_od, valeurs_pr, cle_ecriture in lignes_th106:
+            # Le badge de statut ne reflète que l'écart Odicee <-> Facture ; l'AH n'est qu'une
+            # information affichée en plus, elle ne doit pas influencer la conclusion (déclaration
+            # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
+            statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
+            lignes[""].append(badge(statut_badge))
+            lignes["Champ"].append(label)
+            lignes["Odicee"].append(f"{valeur_od}" if valeur_od not in (None, "") else "—")
+            for dt in docs_presents:
+                v = valeurs_pr.get(dt)
+                lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
+            cles_ecriture_th106.append(cle_ecriture)
+
+        if editable_th106:
+            df_th106 = pd.DataFrame(lignes)
+            colonnes_verrouillees_th106 = [c for c in df_th106.columns if c != "Odicee"]
+            df_th106_edite = st.data_editor(
+                df_th106,
+                disabled=colonnes_verrouillees_th106,
+                column_config={"Odicee": st.column_config.TextColumn("Odicee ✏️")},
+                hide_index=True,
+                key=f"editeur_th106_{fiche_odicee_match}_{adresse_site}",
+            )
+            st.caption(
+                "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
+                "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
+                "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain). "
+                "✏️ Colonne Odicee modifiable, sauf marque/référence chaudière et classe régulateur "
+                "(champs composites/à liste déroulante, non réinjectables tels quels ici)."
+            )
+            for i, cle_ecriture in enumerate(cles_ecriture_th106):
+                if not cle_ecriture:
+                    continue
+                valeur_orig_affichee = lignes["Odicee"][i]
+                valeur_editee = df_th106_edite["Odicee"].iloc[i]
+                if str(valeur_editee) != str(valeur_orig_affichee):
+                    fd[cle_ecriture] = caster_comme_original(fd.get(cle_ecriture), valeur_editee)
+                    modifications_odicee.append((fiche_odicee_match, cle_ecriture, valeur_orig_affichee, valeur_editee))
+            export_technique = {"type": "table", "titre": "Données techniques", "df": df_th106_edite}
+        else:
+            st.table(lignes)
+            st.caption(
+                "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle · ⚪ absent d'un côté "
+                "(Odicee vs Facture uniquement — l'AH est affichée à titre informatif et n'influence pas "
+                "la couleur). Classe régulateur comparée en chiffre arabe (Odicee est en chiffre romain). "
+                "Tableau non modifiable ici (cas « collectif », structure multi-chaudières)."
+            )
+            export_technique = {"type": "table", "titre": "Données techniques", "df": pd.DataFrame(lignes)}
+
+    elif "BAR-TH-158" in ref_upper:
+        odicee_rows, presta_rows, total_od, total_pr = comparer_th158(fd, report)
+        statut_total, detail_total = comparer(total_od, total_pr, tolerance=0)
+        st.markdown(
+            f"{badge(statut_total)} **Total quantité émetteurs** — Odicee : {total_od:g} · "
+            f"Prestataire (somme des factures) : {total_pr:g}"
+        )
+        if statut_total != "ok":
+            st.caption(detail_total or "")
+        st.caption(
+            "Pas de correspondance ligne-à-ligne automatique (l'ordre des lignes n'est pas garanti) — "
+            "rapprochez visuellement marque/référence/quantité entre les deux tableaux ci-dessous."
+        )
+        col_od, col_pr = st.columns(2)
+        with col_od:
+            st.markdown("**Odicee — tableau Equipements ✏️**")
+            try:
+                if odicee_rows:
+                    df_od_th158 = st.data_editor(
+                        pd.DataFrame(odicee_rows),
+                        hide_index=True,
+                        key=f"editeur_th158_{fiche_odicee_match}_{adresse_site}",
+                    )
+                    lignes_modifiees = df_od_th158.to_dict("records") != odicee_rows
+                    if lignes_modifiees and isinstance(fd.get("Equipements"), dict):
+                        nouvelles_lignes = []
+                        for r in df_od_th158.to_dict("records"):
+                            qte = caster_comme_original(1, r.get("Quantité", ""))
+                            puissance = caster_comme_original(1, r.get("Puissance (W)", ""))
+                            nouvelles_lignes.append([
+                                r.get("Marque", ""), r.get("Référence", ""), r.get("N° certif NF", ""),
+                                qte, puissance,
+                            ])
+                        fd["Equipements"]["values"] = json.dumps(nouvelles_lignes, ensure_ascii=False)
+                        modifications_odicee.append(
+                            (fiche_odicee_match, "Equipements", odicee_rows, df_od_th158.to_dict("records"))
+                        )
+                        # Recalcule le total affiché plus haut avec les nouvelles quantités
+                        total_od = sum(normalise_nombre(r.get("Quantité")) or 0 for r in df_od_th158.to_dict("records"))
+                    odicee_rows = df_od_th158.to_dict("records")
+                else:
+                    st.caption("Aucune ligne.")
+            except Exception as e:
+                st.error(f"Affichage impossible pour ce tableau ({e}).")
+                st.write(odicee_rows)
+        with col_pr:
+            st.markdown("**Prestataire — factures**")
+            try:
+                if presta_rows:
+                    st.table(presta_rows)
+                else:
+                    st.caption("Aucune ligne.")
+            except Exception as e:
+                st.error(f"Affichage impossible pour ce tableau ({e}).")
+                st.write(presta_rows)
+        export_technique = {
+            "type": "th158",
+            "titre": "Equipements",
+            "odicee_df": pd.DataFrame(odicee_rows),
+            "presta_df": pd.DataFrame(presta_rows),
+            "total_odicee": total_od,
+            "total_presta": total_pr,
+        }
+
+    else:
+        if "BAR-EN-104" in ref_upper:
+            regles_fiche = champs_en104(data.get("dateEngagementReelle"))
+        else:
+            regles_fiche = REGLES.get(fiche_odicee_match) or next(
+                (v for k, v in REGLES.items() if k in ref_upper), None
+            )
+
+        mapping_fiche = FIELD_MAPPING.get(fiche_odicee_match) or next(
+            (v for k, v in FIELD_MAPPING.items() if k in ref_upper), None
+        )
+
+        if not mapping_fiche:
+            st.warning(
+                f"Aucun mapping de champs défini pour **{fiche_odicee_match}** vers le format prestataire. "
+                "Ajoutez-le dans FIELD_MAPPING une fois un JSON prestataire réel disponible pour cette fiche."
+            )
+        elif not regles_fiche:
+            st.warning(f"Fiche **{fiche_odicee_match}** absente de REGLES (utils_supervision.py).")
+        else:
+            docs_presents = [dt for dt in DOC_TYPES_TECHNIQUES if get_presta_doc_alias(report, dt)]
+            if not docs_presents:
+                st.warning("Aucun document AH/Facture exploitable dans le JSON prestataire.")
+            else:
+                entete = ["", "Champ", "Odicee"] + [LABEL_DOC_TYPE[dt] for dt in docs_presents]
+                lignes = {c: [] for c in entete}
+                # Parallèle à `lignes` : clé formData brute et indicateur "champ encodé" (valeur
+                # affichée décodée par decoder_valeur, ex: type de pose 0/1 -> texte) pour chaque
+                # ligne éditable — on ne permet pas la modification des champs encodés ici, le
+                # risque de réinjecter un texte au lieu du code numérique attendu par Odicee est
+                # trop élevé pour un simple champ texte.
+                cles_od_lignes = []
+                encode_lignes = []
+
+                for cle_od, label, unite, critique in regles_fiche:
+                    if cle_od not in mapping_fiche:
+                        continue
+                    cle_pr = mapping_fiche[cle_od]
+
+                    # Champ cumulable (ex: surface) sur une fiche à plusieurs lots (plusieurs
+                    # bâtiments d'un même complexe) : la facture prestataire donne souvent un total
+                    # combiné plutôt qu'un chiffre par bâtiment — on doit alors sommer Odicee sur
+                    # tous les lots de la fiche pour comparer des totaux équivalents, sinon chaque
+                    # lot ressort systématiquement en faux écart net face au total facturé.
+                    est_cumule = False
+                    if cle_od in CHAMPS_CUMULABLES and len(lots_sites) > 1:
+                        valeurs_lots = [normalise_nombre(l.get("formData", {}).get(cle_od)) for l, _ in lots_sites]
+                        if all(v is not None for v in valeurs_lots):
+                            valeur_od = sum(valeurs_lots)
+                            valeur_od_dec = valeur_od
+                            est_cumule = True
+                    if not est_cumule:
+                        valeur_od = fd.get(cle_od)
+                        valeur_od_dec = decoder_valeur(fiche_odicee_match, cle_od, valeur_od)
+
+                    valeurs_pr = {}
+                    for dt in docs_presents:
+                        v, _fname = get_presta_technical_value(report, dt, cle_pr)
+                        valeurs_pr[dt] = v
+
+                    # Statut du badge = comparaison Odicee <-> Facture uniquement ; l'AH reste
+                    # affichée à titre d'information mais n'influence pas la conclusion (déclaration
+                    # signée par le bénéficiaire, pas une pièce probante recoupable comme une facture).
+                    statut_badge, _ = comparer(valeur_od, valeurs_pr.get("Invoice"))
+
+                    lignes[""].append(badge(statut_badge))
+                    lignes["Champ"].append(
+                        f"{label}" + (f" ({unite})" if unite else "")
+                        + (" [cumulé, tous lots]" if est_cumule else "")
+                    )
+                    lignes["Odicee"].append(
+                        f"{valeur_od_dec}" if valeur_od_dec not in (None, "") else "—"
+                    )
+                    for dt in docs_presents:
+                        v = valeurs_pr[dt]
+                        lignes[LABEL_DOC_TYPE[dt]].append(fmt_date_any(v) if v not in (None, "") else "—")
+
+                    cles_od_lignes.append(cle_od)
+                    # Un total cumulé ne se réinjecte pas proprement dans le formData d'un seul lot :
+                    # non éditable, comme les champs encodés (même mécanisme de verrouillage).
+                    encode_lignes.append(est_cumule or str(valeur_od_dec) != str(valeur_od))
+
+                if lignes["Champ"]:
+                    df_lignes = pd.DataFrame(lignes)
+                    colonnes_verrouillees = [c for c in df_lignes.columns if c != "Odicee"]
+                    # Les champs encodés (liste déroulante Odicee ex: type de pose) restent en
+                    # lecture seule : data_editor ne permet pas de désactiver une cellule isolée.
+                    df_lignes["_editable"] = [not e for e in encode_lignes]
+
+                    df_edite = st.data_editor(
+                        df_lignes.drop(columns=["_editable"]),
+                        disabled=colonnes_verrouillees + (["Odicee"] if all(encode_lignes) else []),
+                        column_config={
+                            "Odicee": st.column_config.TextColumn(
+                                "Odicee ✏️" if not all(encode_lignes) else "Odicee"
+                            )
+                        },
+                        hide_index=True,
+                        key=f"editeur_technique_{fiche_odicee_match}_{adresse_site}",
+                    )
+                    st.caption(
+                        "🟢 valeurs concordantes · 🔴 écart net · 🟡 correspondance partielle (à vérifier "
+                        "visuellement, ex. texte tronqué/reformaté) · ⚪ champ absent d'un des deux côtés — "
+                        "comparaison Odicee vs Facture uniquement (l'AH est affichée à titre informatif et "
+                        "n'influence pas la couleur). "
+                        "✏️ Colonne Odicee modifiable (les champs à liste déroulante — type de pose, "
+                        "classe de régulateur... — restent en lecture seule ici)."
+                    )
+
+                    for i, cle_od in enumerate(cles_od_lignes):
+                        if encode_lignes[i]:
+                            continue
+                        valeur_originale = fd.get(cle_od)
+                        valeur_affichee_orig = lignes["Odicee"][i]
+                        valeur_editee = df_edite["Odicee"].iloc[i]
+                        if str(valeur_editee) != str(valeur_affichee_orig):
+                            fd[cle_od] = caster_comme_original(valeur_originale, valeur_editee)
+                            modifications_odicee.append((fiche_odicee_match, cle_od, valeur_affichee_orig, valeur_editee))
+
+                    export_technique = {"type": "table", "titre": "Données techniques", "df": df_edite}
+                else:
+                    st.caption("Aucun champ mappé n'a de correspondance exploitable.")
+
+
+    # ── Règles de conformité déjà calculées par le prestataire (pour contexte) ──
+    with st.expander("📜 Règles de conformité du prestataire (pour information)"):
+        # Les règles "bloquantes" (NonCompliant, ex: RGE, ancienneté de la facture) sont souvent
+        # rattachées à un document précis (documents[].rules[]) plutôt qu'aux règles globales du
+        # dossier (globalRules) — les deux sources sont agrégées ici pour ne rien manquer, comme
+        # le fait l'outil du prestataire lui-même ("Dossier non éligible" + "Anomalies à corriger").
+        non_conformes = []
+        for r in report.get("globalRules", []) or []:
+            if r.get("status") != "Compliant":
+                non_conformes.append(r)
+        for doc in report.get("documents", []) or []:
+            for r in doc.get("rules", []) or []:
+                if r.get("status") != "Compliant":
+                    r = dict(r)
+                    r.setdefault("documentRef", doc.get("fileName"))
+                    non_conformes.append(r)
+
+        if non_conformes:
+            bloquantes = [r for r in non_conformes if r.get("status") == "NonCompliant"]
+            a_verifier = [r for r in non_conformes if r.get("status") != "NonCompliant"]
+            if bloquantes:
+                st.markdown("**🔴 Dossier non éligible**")
+                for r in bloquantes:
+                    source = f" *(source : {r['documentRef']})*" if r.get("documentRef") else ""
+                    st.markdown(f"🔴 **{r.get('ruleId')}** — {r.get('message')}{source}")
+            if a_verifier:
+                st.markdown("**🟡 Anomalies à corriger**")
+                for r in a_verifier:
+                    source = f" *(source : {r['documentRef']})*" if r.get("documentRef") else ""
+                    st.markdown(f"🟡 **{r.get('ruleId')}** — {r.get('message')}{source}")
+        else:
+            st.caption("Aucune non-conformité signalée par le prestataire.")
+
+
+    # ─────────────────────────────────────────────
+    # EXPORT DU RAPPORT (Excel)
+    # ─────────────────────────────────────────────
+
+    def construire_rapport_excel():
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            # ── Feuille unique "Comparaison" : identité dossier + administratif + technique ──
+            df_admin = pd.DataFrame(
+                [{"Champ": "Site", "Odicee": adresse_site, "Prestataire": "", "Détail écart": ""}]
+                + [
+                    {"Champ": label, "Odicee": v_od, "Prestataire": v_pr, "Détail écart": detail}
+                    for _, label, v_od, v_pr, detail in lignes_html
+                ]
+            )
+
+            ligne_courante = 0
+            feuille = "Comparaison"
+            pd.DataFrame(
+                [{"Dossier": f"{id_odicee} (Odicee) / {filenumber_presta} (Prestataire)", "Fiche": fiche_odicee_match}]
+            ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+            ligne_courante += 3
+
+            df_admin.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+            ligne_courante += len(df_admin) + 3
+
+            if export_technique:
+                if export_technique["type"] == "table":
+                    pd.DataFrame([{"Champ": "── Données techniques ──"}]).to_excel(
+                        writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                    )
+                    ligne_courante += 1
+                    export_technique["df"].to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+                    ligne_courante += len(export_technique["df"])
+                elif export_technique["type"] == "th158":
+                    pd.DataFrame([{"Champ": "── Equipements Odicee ──"}]).to_excel(
+                        writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                    )
+                    ligne_courante += 1
+                    export_technique["odicee_df"].to_excel(
+                        writer, sheet_name=feuille, index=False, startrow=ligne_courante
+                    )
+                    ligne_courante += len(export_technique["odicee_df"]) + 3
+
+                    pd.DataFrame([{"Champ": "── Equipements Prestataire ──"}]).to_excel(
+                        writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                    )
+                    ligne_courante += 1
+                    export_technique["presta_df"].to_excel(
+                        writer, sheet_name=feuille, index=False, startrow=ligne_courante
+                    )
+                    ligne_courante += len(export_technique["presta_df"]) + 3
+
+                    pd.DataFrame(
+                        {
+                            "Total": ["Odicee", "Prestataire"],
+                            "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
+                        }
+                    ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+                ligne_courante += 6
+
+            # ── Commentaires (visuel des problèmes / évolution), en bas du tableau de comparaison ──
+            if supabase_ok:
+                commentaires_export = lister_commentaires(normaliser_numero_dossier(id_odicee))
+                if commentaires_export:
+                    pd.DataFrame([{"Champ": "── Commentaires ──"}]).to_excel(
+                        writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                    )
+                    ligne_courante += 1
+                    df_commentaires = pd.DataFrame([
+                        {
+                            "Date": (c.get("date_ajout") or "")[:10],
+                            "Analyse liée": (
+                                "analyse du " + ((c.get("dossiers_prestataire") or {}).get("date_analyse")
+                                                  or (c.get("dossiers_prestataire") or {}).get("date_ajout") or "?")[:10]
+                                if c.get("dossiers_prestataire") else "non identifiée"
+                            ),
+                            "Commentaire": c["commentaire"],
+                        }
+                        for c in commentaires_export
+                    ])
+                    df_commentaires.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+
+            df_regles = pd.DataFrame(
+                [
+                    {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message"),
+                     "Document source": r.get("documentRef") or ""}
+                    for r in non_conformes
+                ]
+            ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message", "Document source"])
+            df_regles.to_excel(writer, sheet_name="Non-conformités prestataire", index=False)
+
+        return buffer.getvalue()
+
+
+    colex1, colex2 = st.columns(2)
+    with colex1:
+        st.download_button(
+            "📥 Télécharger le rapport (Excel)",
+            data=construire_rapport_excel(),
+            file_name=f"{datetime.now().strftime('%Y-%m-%d')}_{id_odicee}_{fiche_odicee_match}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with colex2:
+        if modifications_odicee:
+            cdl1, cdl2 = st.columns(2)
+            with cdl1:
+                st.download_button(
+                    "📥 Télécharger le JSON modifié",
+                    data=json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                    file_name=f"{id_odicee}_modifie.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            with cdl2:
+                if supabase_ok:
+                    if st.button("💾 Mettre à jour dans Supabase", use_container_width=True):
+                        ok_maj, msg_maj = sauvegarder_dossier_odicee(data, fiche=fiche_odicee_match)
+                        if ok_maj:
+                            lister_dossiers_odicee.clear()
+                            lister_tous_numeros_connus.clear()
+                            st.success(f"✅ Dossier Odicee {id_odicee} mis à jour dans Supabase avec les modifications.")
+                        else:
+                            st.error(f"⚠️ Échec de la mise à jour : {msg_maj}")
+        else:
+            st.caption("Aucune modification apportée aux valeurs Odicee — rien à réexporter en JSON.")
+
+    if modifications_odicee:
+        with st.expander(f"✏️ {len(modifications_odicee)} modification(s) apportée(s) aux valeurs Odicee"):
+            for fiche_mod, cle_mod, avant, apres in modifications_odicee:
+                st.caption(f"**{cle_mod}** ({fiche_mod}) : {avant} → {apres}")
+
+
+    # ─────────────────────────────────────────────
+    # COMMENTAIRES (visuel des problèmes + évolution, par dossier et par version prestataire)
+    # ─────────────────────────────────────────────
+
+    commentaires_dossier = []
+    if supabase_ok:
+        st.markdown("---")
+        st.markdown("## 💬 Commentaires")
+
+        numero_pour_commentaire = normaliser_numero_dossier(id_odicee)
+        nouveau_commentaire = st.text_area(
+            "Ajouter un commentaire sur ce dossier",
+            placeholder="Ex: écart de surface non résolu, à relancer côté prestataire...",
+            key="nouveau_commentaire",
+        )
+        if st.button("💬 Ajouter le commentaire"):
+            ok_com, msg_com = ajouter_commentaire(numero_pour_commentaire, id_analyse_active, nouveau_commentaire)
+            if ok_com:
+                lister_commentaires.clear()
+                st.success("Commentaire ajouté.")
+            else:
+                st.error(f"⚠️ {msg_com}")
+
+        commentaires_dossier = lister_commentaires(numero_pour_commentaire)
+        if commentaires_dossier:
+            with st.expander(f"🗂️ {len(commentaires_dossier)} commentaire(s) enregistré(s) pour ce dossier", expanded=True):
+                for c in commentaires_dossier:
+                    analyse_liee = c.get("dossiers_prestataire")
+                    if analyse_liee:
+                        date_analyse = (analyse_liee.get("date_analyse") or analyse_liee.get("date_ajout") or "")[:10]
+                        libelle_analyse = f"analyse du {date_analyse}"
+                    else:
+                        libelle_analyse = "analyse non identifiée"
+                    date_com = (c.get("date_ajout") or "")[:10]
+                    cc1, cc2 = st.columns([8, 1])
+                    cc1.markdown(f"**{date_com}** *(commentaire sur l'{libelle_analyse})* — {c['commentaire']}")
+                    if cc2.button("🗑️", key=f"suppr_com_{c['id']}"):
+                        ok_del, err_del = supprimer_commentaire(c["id"])
+                        if ok_del:
+                            lister_commentaires.clear()
+                            st.rerun()
+                        else:
+                            st.error(f"⚠️ {err_del}")
+
+        else:
+            st.caption("Aucun commentaire enregistré pour ce dossier pour l'instant.")
+
+        tous_commentaires = lister_tous_commentaires()
+        if tous_commentaires:
+            lignes_csv = [["Numéro dossier", "Date commentaire", "Analyse prestataire liée", "Commentaire"]]
+            for c in tous_commentaires:
                 analyse_liee = c.get("dossiers_prestataire")
                 if analyse_liee:
                     date_analyse = (analyse_liee.get("date_analyse") or analyse_liee.get("date_ajout") or "")[:10]
                     libelle_analyse = f"analyse du {date_analyse}"
                 else:
-                    libelle_analyse = "analyse non identifiée"
-                date_com = (c.get("date_ajout") or "")[:10]
-                cc1, cc2 = st.columns([8, 1])
-                cc1.markdown(f"**{date_com}** *(commentaire sur l'{libelle_analyse})* — {c['commentaire']}")
-                if cc2.button("🗑️", key=f"suppr_com_{c['id']}"):
-                    ok_del, err_del = supprimer_commentaire(c["id"])
-                    if ok_del:
-                        lister_commentaires.clear()
-                        st.rerun()
-                    else:
-                        st.error(f"⚠️ {err_del}")
+                    libelle_analyse = "non identifiée"
+                lignes_csv.append([
+                    c["numero_dossier"],
+                    (c.get("date_ajout") or "")[:10],
+                    libelle_analyse,
+                    c["commentaire"],
+                ])
+            csv_buffer = io.StringIO()
+            csv.writer(csv_buffer, delimiter=";").writerows(lignes_csv)
+            st.download_button(
+                "📥 Télécharger tous les commentaires (tous dossiers)",
+                data=csv_buffer.getvalue().encode("utf-8-sig"),
+                file_name=f"{datetime.now().strftime('%Y-%m-%d')}_commentaires_tous_dossiers.csv",
+                mime="text/csv",
+            )
 
-    else:
-        st.caption("Aucun commentaire enregistré pour ce dossier pour l'instant.")
 
-    tous_commentaires = lister_tous_commentaires()
-    if tous_commentaires:
-        lignes_csv = [["Numéro dossier", "Date commentaire", "Analyse prestataire liée", "Commentaire"]]
-        for c in tous_commentaires:
-            analyse_liee = c.get("dossiers_prestataire")
-            if analyse_liee:
-                date_analyse = (analyse_liee.get("date_analyse") or analyse_liee.get("date_ajout") or "")[:10]
-                libelle_analyse = f"analyse du {date_analyse}"
+    # ─────────────────────────────────────────────
+    # SURLIGNAGE PDF (optionnel — même analyse que ci-dessus, appliquée aux PDF du dossier)
+    # ─────────────────────────────────────────────
+
+    st.markdown("---")
+    st.markdown("## 🖍️ Surlignage PDF (optionnel)")
+    st.caption(
+        "Déposez le ZIP des pièces jointes de ce dossier pour surligner, directement sur les PDF, "
+        "les valeurs Odicee et prestataire déjà comparées ci-dessus — "
+        "🟩 trouvée aux deux endroits · 🟥 Odicee seul · 🟨 prestataire seul."
+    )
+
+    fichier_zip_surlignage = st.file_uploader("ZIP des PDF du dossier", type="zip", key="zip_surlignage")
+
+    if fichier_zip_surlignage:
+        if not OCR_DISPONIBLE:
+            st.warning(
+                "⚠️ Tesseract OCR n'est pas disponible sur ce serveur — seuls les PDF avec calque "
+                "texte pourront être surlignés (les PDF scannés seront ignorés).\n\n"
+                "**Sur Streamlit Community Cloud** : ajoutez un fichier `packages.txt` à la racine "
+                "du repo contenant `tesseract-ocr` et `tesseract-ocr-fra`, puis redémarrez l'app "
+                "(Manage app → Reboot).\n\n"
+                "**Sur un serveur classique** : `apt install tesseract-ocr tesseract-ocr-fra`."
+            )
+
+        try:
+            zf = zipfile.ZipFile(fichier_zip_surlignage)
+            pdfs_zip = {n: zf.read(n) for n in zf.namelist() if n.lower().endswith(".pdf")}
+        except Exception as e:
+            st.error(f"ZIP invalide : {e}")
+            pdfs_zip = None
+
+        if pdfs_zip is not None:
+            documents_surlignables = [
+                d for d in documents_presta if d.get("type") not in DOC_TYPES_EXCLUS_SURLIGNAGE
+            ]
+            if not documents_surlignables:
+                st.warning("Aucun document surlignable dans ce rapport (l'attestation sur l'honneur est exclue).")
             else:
-                libelle_analyse = "non identifiée"
-            lignes_csv.append([
-                c["numero_dossier"],
-                (c.get("date_ajout") or "")[:10],
-                libelle_analyse,
-                c["commentaire"],
-            ])
-        csv_buffer = io.StringIO()
-        csv.writer(csv_buffer, delimiter=";").writerows(lignes_csv)
-        st.download_button(
-            "📥 Télécharger tous les commentaires (tous dossiers)",
-            data=csv_buffer.getvalue().encode("utf-8-sig"),
-            file_name=f"{datetime.now().strftime('%Y-%m-%d')}_commentaires_tous_dossiers.csv",
-            mime="text/csv",
-        )
+                valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot, data, report)
 
+                noms_docs_pdf = [d.get("fileName") for d in documents_surlignables if d.get("fileName")]
+                doc_choisi_nom_pdf = st.selectbox("Document à surligner :", noms_docs_pdf, key="doc_surlignage")
+                doc_choisi_pdf = next(d for d in documents_surlignables if d.get("fileName") == doc_choisi_nom_pdf)
 
-# ─────────────────────────────────────────────
-# SURLIGNAGE PDF (optionnel — même analyse que ci-dessus, appliquée aux PDF du dossier)
-# ─────────────────────────────────────────────
-
-st.markdown("---")
-st.markdown("## 🖍️ Surlignage PDF (optionnel)")
-st.caption(
-    "Déposez le ZIP des pièces jointes de ce dossier pour surligner, directement sur les PDF, "
-    "les valeurs Odicee et prestataire déjà comparées ci-dessus — "
-    "🟩 trouvée aux deux endroits · 🟥 Odicee seul · 🟨 prestataire seul."
-)
-
-fichier_zip_surlignage = st.file_uploader("ZIP des PDF du dossier", type="zip", key="zip_surlignage")
-
-if fichier_zip_surlignage:
-    if not OCR_DISPONIBLE:
-        st.warning(
-            "⚠️ Tesseract OCR n'est pas disponible sur ce serveur — seuls les PDF avec calque "
-            "texte pourront être surlignés (les PDF scannés seront ignorés).\n\n"
-            "**Sur Streamlit Community Cloud** : ajoutez un fichier `packages.txt` à la racine "
-            "du repo contenant `tesseract-ocr` et `tesseract-ocr-fra`, puis redémarrez l'app "
-            "(Manage app → Reboot).\n\n"
-            "**Sur un serveur classique** : `apt install tesseract-ocr tesseract-ocr-fra`."
-        )
-
-    try:
-        zf = zipfile.ZipFile(fichier_zip_surlignage)
-        pdfs_zip = {n: zf.read(n) for n in zf.namelist() if n.lower().endswith(".pdf")}
-    except Exception as e:
-        st.error(f"ZIP invalide : {e}")
-        pdfs_zip = None
-
-    if pdfs_zip is not None:
-        documents_surlignables = [
-            d for d in documents_presta if d.get("type") not in DOC_TYPES_EXCLUS_SURLIGNAGE
-        ]
-        if not documents_surlignables:
-            st.warning("Aucun document surlignable dans ce rapport (l'attestation sur l'honneur est exclue).")
-        else:
-            valeurs_odicee_pdf = valeurs_odicee_dossier_pdf(fd, lot, data, report)
-
-            noms_docs_pdf = [d.get("fileName") for d in documents_surlignables if d.get("fileName")]
-            doc_choisi_nom_pdf = st.selectbox("Document à surligner :", noms_docs_pdf, key="doc_surlignage")
-            doc_choisi_pdf = next(d for d in documents_surlignables if d.get("fileName") == doc_choisi_nom_pdf)
-
-            nom_fichier_zip_pdf = trouver_fichier_zip(pdfs_zip, doc_choisi_nom_pdf)
-            if not nom_fichier_zip_pdf:
-                st.error(
-                    f"Le fichier **{doc_choisi_nom_pdf}** annoncé par le prestataire est introuvable "
-                    f"dans le ZIP. Fichiers disponibles : {', '.join(pdfs_zip) or '—'}"
-                )
-            else:
-                valeurs_presta_pdf = valeurs_presta_document(doc_choisi_pdf)
-
-                with st.expander(f"🟨 {len(valeurs_presta_pdf)} valeur(s) prestataire recherchée(s) sur ce document"):
-                    st.write({l: v for l, v in valeurs_presta_pdf})
-                with st.expander(f"🟥 {len(valeurs_odicee_pdf)} valeur(s) Odicee recherchée(s) (tous documents)"):
-                    st.write({l: v for l, v in valeurs_odicee_pdf})
-
-                pdf_bytes_sel = pdfs_zip[nom_fichier_zip_pdf]
-                nb_pages_sel = fitz.open(stream=pdf_bytes_sel, filetype="pdf").page_count
-                a_calque_texte_sel = any(
-                    len(fitz.open(stream=pdf_bytes_sel, filetype="pdf")[i].get_text().strip()) > 20
-                    for i in range(nb_pages_sel)
-                )
-                if not a_calque_texte_sel:
-                    st.caption(
-                        f"📄 Document scanné ({nb_pages_sel} page(s)) — traitement par OCR, "
-                        "peut prendre quelques secondes."
+                nom_fichier_zip_pdf = trouver_fichier_zip(pdfs_zip, doc_choisi_nom_pdf)
+                if not nom_fichier_zip_pdf:
+                    st.error(
+                        f"Le fichier **{doc_choisi_nom_pdf}** annoncé par le prestataire est introuvable "
+                        f"dans le ZIP. Fichiers disponibles : {', '.join(pdfs_zip) or '—'}"
                     )
+                else:
+                    valeurs_presta_pdf = valeurs_presta_document(doc_choisi_pdf)
 
-                with st.spinner("Surlignage en cours..."):
-                    pdf_annote_sel, trouvees_sel, non_trouvees_sel = surligner_pdf(
-                        pdf_bytes_sel, valeurs_presta_pdf, valeurs_odicee_pdf
+                    with st.expander(f"🟨 {len(valeurs_presta_pdf)} valeur(s) prestataire recherchée(s) sur ce document"):
+                        st.write({l: v for l, v in valeurs_presta_pdf})
+                    with st.expander(f"🟥 {len(valeurs_odicee_pdf)} valeur(s) Odicee recherchée(s) (tous documents)"):
+                        st.write({l: v for l, v in valeurs_odicee_pdf})
+
+                    pdf_bytes_sel = pdfs_zip[nom_fichier_zip_pdf]
+                    nb_pages_sel = fitz.open(stream=pdf_bytes_sel, filetype="pdf").page_count
+                    a_calque_texte_sel = any(
+                        len(fitz.open(stream=pdf_bytes_sel, filetype="pdf")[i].get_text().strip()) > 20
+                        for i in range(nb_pages_sel)
                     )
+                    if not a_calque_texte_sel:
+                        st.caption(
+                            f"📄 Document scanné ({nb_pages_sel} page(s)) — traitement par OCR, "
+                            "peut prendre quelques secondes."
+                        )
 
-                cc1, cc2 = st.columns(2)
-                cc1.metric("Valeurs localisées", len(trouvees_sel))
-                cc2.metric("Valeurs non localisées", len(non_trouvees_sel))
-                if non_trouvees_sel:
-                    with st.expander("⚪ Valeurs non localisées sur ce document"):
-                        for l, v in non_trouvees_sel:
-                            st.caption(f"{l} : {v}")
+                    with st.spinner("Surlignage en cours..."):
+                        pdf_annote_sel, trouvees_sel, non_trouvees_sel = surligner_pdf(
+                            pdf_bytes_sel, valeurs_presta_pdf, valeurs_odicee_pdf
+                        )
 
-                st.download_button(
-                    "📥 Télécharger ce PDF surligné",
-                    data=pdf_annote_sel,
-                    file_name=f"surligne_{doc_choisi_nom_pdf}",
-                    mime="application/pdf",
-                )
+                    cc1, cc2 = st.columns(2)
+                    cc1.metric("Valeurs localisées", len(trouvees_sel))
+                    cc2.metric("Valeurs non localisées", len(non_trouvees_sel))
+                    if non_trouvees_sel:
+                        with st.expander("⚪ Valeurs non localisées sur ce document"):
+                            for l, v in non_trouvees_sel:
+                                st.caption(f"{l} : {v}")
 
-                st.caption(
-                    "Génère un ZIP avec chaque document du dossier surligné (hors attestation "
-                    "sur l'honneur). Peut prendre du temps si plusieurs PDF sont scannés."
-                )
-                if st.button("Générer le ZIP de tous les documents surlignés"):
-                    zip_buffer_sel = io.BytesIO()
-                    with st.spinner("Surlignage de tous les documents en cours..."):
-                        with zipfile.ZipFile(zip_buffer_sel, "w", zipfile.ZIP_DEFLATED) as zout:
-                            barre_sel = st.progress(0.0)
-                            for i, doc_p in enumerate(documents_surlignables):
-                                nom_p = doc_p.get("fileName")
-                                nom_zip_p = trouver_fichier_zip(pdfs_zip, nom_p)
-                                if not nom_zip_p:
-                                    st.caption(f"⚠️ {nom_p} introuvable dans le ZIP — ignoré.")
-                                    continue
-                                pdf_bytes_p = pdfs_zip[nom_zip_p]
-                                valeurs_presta_p = valeurs_presta_document(doc_p)
-                                pdf_annote_p, _, _ = surligner_pdf(pdf_bytes_p, valeurs_presta_p, valeurs_odicee_pdf)
-                                zout.writestr(f"surligne_{nom_p}", pdf_annote_p)
-                                barre_sel.progress((i + 1) / len(documents_surlignables))
                     st.download_button(
-                        "📥 Télécharger le ZIP",
-                        data=zip_buffer_sel.getvalue(),
-                        file_name=f"surlignage_{id_odicee}.zip",
-                        mime="application/zip",
+                        "📥 Télécharger ce PDF surligné",
+                        data=pdf_annote_sel,
+                        file_name=f"surligne_{doc_choisi_nom_pdf}",
+                        mime="application/pdf",
                     )
 
-                st.markdown("---")
-                doc_rendu_sel = fitz.open(stream=pdf_annote_sel, filetype="pdf")
-                for i in range(doc_rendu_sel.page_count):
-                    pix_sel = doc_rendu_sel[i].get_pixmap(matrix=fitz.Matrix(1.8, 1.8))
-                    st.image(
-                        pix_sel.tobytes("png"),
-                        caption=f"Page {i + 1}/{doc_rendu_sel.page_count}",
-                        use_container_width=True,
+                    st.caption(
+                        "Génère un ZIP avec chaque document du dossier surligné (hors attestation "
+                        "sur l'honneur). Peut prendre du temps si plusieurs PDF sont scannés."
                     )
+                    if st.button("Générer le ZIP de tous les documents surlignés"):
+                        zip_buffer_sel = io.BytesIO()
+                        with st.spinner("Surlignage de tous les documents en cours..."):
+                            with zipfile.ZipFile(zip_buffer_sel, "w", zipfile.ZIP_DEFLATED) as zout:
+                                barre_sel = st.progress(0.0)
+                                for i, doc_p in enumerate(documents_surlignables):
+                                    nom_p = doc_p.get("fileName")
+                                    nom_zip_p = trouver_fichier_zip(pdfs_zip, nom_p)
+                                    if not nom_zip_p:
+                                        st.caption(f"⚠️ {nom_p} introuvable dans le ZIP — ignoré.")
+                                        continue
+                                    pdf_bytes_p = pdfs_zip[nom_zip_p]
+                                    valeurs_presta_p = valeurs_presta_document(doc_p)
+                                    pdf_annote_p, _, _ = surligner_pdf(pdf_bytes_p, valeurs_presta_p, valeurs_odicee_pdf)
+                                    zout.writestr(f"surligne_{nom_p}", pdf_annote_p)
+                                    barre_sel.progress((i + 1) / len(documents_surlignables))
+                        st.download_button(
+                            "📥 Télécharger le ZIP",
+                            data=zip_buffer_sel.getvalue(),
+                            file_name=f"surlignage_{id_odicee}.zip",
+                            mime="application/zip",
+                        )
+
+                    st.markdown("---")
+                    doc_rendu_sel = fitz.open(stream=pdf_annote_sel, filetype="pdf")
+                    for i in range(doc_rendu_sel.page_count):
+                        pix_sel = doc_rendu_sel[i].get_pixmap(matrix=fitz.Matrix(1.8, 1.8))
+                        st.image(
+                            pix_sel.tobytes("png"),
+                            caption=f"Page {i + 1}/{doc_rendu_sel.page_count}",
+                            use_container_width=True,
+                        )
