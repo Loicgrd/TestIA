@@ -1320,11 +1320,17 @@ c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart —
 
 if dossier_id:
     url_odicee = f"https://odicee.edf.fr/api/dossiers/{dossier_id}"
-    liens = [f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>']
+    url_odicee_appli = f"https://odicee.edf.fr/dossiers/{dossier_id}"
+    liens = [
+        f'<a href="{url_odicee}" target="_blank">🔗 Ouvrir le JSON Odicee (API)</a>',
+        f'<a href="{url_odicee_appli}" target="_blank">🔗 Ouvrir le dossier Odicee</a>',
+    ]
     id_technique_presta = presta.get("id")
     if id_technique_presta:
         url_presta = f"https://docminddev.promotelec-services.com/api/dossiers/{id_technique_presta}"
+        url_presta_appli = f"https://docminddev.promotelec-services.com/dossier/{id_technique_presta}"
         liens.append(f'<a href="{url_presta}" target="_blank">🔗 Ouvrir le JSON Prestataire (API)</a>')
+        liens.append(f'<a href="{url_presta_appli}" target="_blank">🔗 Ouvrir le dossier Prestataire</a>')
     st.markdown("&nbsp;&nbsp;·&nbsp;&nbsp;".join(liens), unsafe_allow_html=True)
 
 if not match_id:
