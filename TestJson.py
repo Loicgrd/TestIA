@@ -1345,9 +1345,11 @@ filenumber_presta = str(presta.get("fileNumber") or report.get("fileNumber") or 
 # canonique que côté Odicee, pour que les deux se retrouvent dans le même historique.
 numero_dossier_presta = normaliser_numero_dossier(filenumber_presta)
 
-if fichier_presta and filenumber_presta:
-    # Historique conservé (insert), sauf si rigoureusement identique à la dernière version
-    # enregistrée (évite les doublons quand on redépose le même fichier par erreur).
+cle_session_presta = f"_presta_deja_sauvegarde_{getattr(fichier_presta, 'file_id', None) or (fichier_presta.name if fichier_presta else None)}"
+if fichier_presta and filenumber_presta and not st.session_state.get(cle_session_presta):
+    # Sauvegarde dans Supabase une seule fois par fichier réellement uploadé — pas à chaque
+    # interaction/rerun de la page (ex: ajouter un commentaire), sinon chaque clic redéclenche
+    # un aller-retour réseau inutile (vérification anti-doublon + insertion).
     ok_presta, msg_presta = sauvegarder_analyse_prestataire(presta, numero_dossier_presta, fiche_presta)
     if ok_presta and msg_presta == "identique":
         st.toast(f"ℹ️ Identique à la dernière version enregistrée pour {numero_dossier_presta} — pas de doublon créé.", icon="ℹ️")
@@ -1361,10 +1363,15 @@ if fichier_presta and filenumber_presta:
         st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
     if ok_presta and supabase_ok:
         # Retrouve l'id Supabase de cette analyse (celle qu'on vient d'insérer, ou celle déjà
-        # identique) pour pouvoir y rattacher des commentaires.
+        # identique) pour pouvoir y rattacher des commentaires — mémorisé pour ne pas avoir à
+        # requêter Supabase de nouveau à chaque rerun tant que c'est le même fichier.
         _historique_maj = lister_historique_prestataire(numero_dossier_presta)
         if _historique_maj:
             id_analyse_active = _historique_maj[0]["id"]
+            st.session_state["_id_analyse_active_courante"] = id_analyse_active
+    st.session_state[cle_session_presta] = True
+elif fichier_presta and st.session_state.get("_id_analyse_active_courante"):
+    id_analyse_active = st.session_state["_id_analyse_active_courante"]
 
 # ── Vérification d'identité dossier ──
 st.markdown("### 🪪 Identification du dossier")
@@ -1447,10 +1454,13 @@ st.markdown("---")
 lots_par_fiche = get_odicee_lots_bar(data)
 fiche_odicee_match = next((f for f in lots_par_fiche if f.upper() == fiche_presta), None)
 
-if fichier_odicee and lots_par_fiche:
-    # Sauvegarde dans Supabase à chaque nouvel upload (upsert : écrase la version précédente
-    # du même dossier). Message explicite en cas d'échec pour pouvoir diagnostiquer.
+cle_session_odicee = f"_odicee_deja_sauvegarde_{getattr(fichier_odicee, 'file_id', None) or (fichier_odicee.name if fichier_odicee else None)}"
+if fichier_odicee and lots_par_fiche and not st.session_state.get(cle_session_odicee):
+    # Sauvegarde dans Supabase une seule fois par fichier réellement uploadé (upsert : écrase
+    # la version précédente du même dossier) — pas à chaque interaction/rerun de la page (ex:
+    # ajouter un commentaire), sinon chaque clic redéclenche un aller-retour réseau inutile.
     ok_odicee, msg_odicee = sauvegarder_dossier_odicee(data, fiche=next(iter(lots_par_fiche), None))
+    st.session_state[cle_session_odicee] = True
     if ok_odicee:
         st.toast(f"✅ Dossier Odicee {id_odicee} enregistré.", icon="💾")
         lister_dossiers_odicee.clear()
@@ -2014,7 +2024,6 @@ if supabase_ok:
         if ok_com:
             lister_commentaires.clear()
             st.success("Commentaire ajouté.")
-            st.rerun()
         else:
             st.error(f"⚠️ {msg_com}")
 
