@@ -1884,12 +1884,34 @@ else:
 
 # ── Règles de conformité déjà calculées par le prestataire (pour contexte) ──
 with st.expander("📜 Règles de conformité du prestataire (pour information)"):
-    global_rules = report.get("globalRules", []) or []
-    non_conformes = [r for r in global_rules if r.get("status") != "Compliant"]
+    # Les règles "bloquantes" (NonCompliant, ex: RGE, ancienneté de la facture) sont souvent
+    # rattachées à un document précis (documents[].rules[]) plutôt qu'aux règles globales du
+    # dossier (globalRules) — les deux sources sont agrégées ici pour ne rien manquer, comme
+    # le fait l'outil du prestataire lui-même ("Dossier non éligible" + "Anomalies à corriger").
+    non_conformes = []
+    for r in report.get("globalRules", []) or []:
+        if r.get("status") != "Compliant":
+            non_conformes.append(r)
+    for doc in report.get("documents", []) or []:
+        for r in doc.get("rules", []) or []:
+            if r.get("status") != "Compliant":
+                r = dict(r)
+                r.setdefault("documentRef", doc.get("fileName"))
+                non_conformes.append(r)
+
     if non_conformes:
-        for r in non_conformes:
-            icone = "🔴" if r.get("status") == "NonCompliant" else "🟡"
-            st.markdown(f"{icone} **{r.get('ruleId')}** — {r.get('message')}")
+        bloquantes = [r for r in non_conformes if r.get("status") == "NonCompliant"]
+        a_verifier = [r for r in non_conformes if r.get("status") != "NonCompliant"]
+        if bloquantes:
+            st.markdown("**🔴 Dossier non éligible**")
+            for r in bloquantes:
+                source = f" *(source : {r['documentRef']})*" if r.get("documentRef") else ""
+                st.markdown(f"🔴 **{r.get('ruleId')}** — {r.get('message')}{source}")
+        if a_verifier:
+            st.markdown("**🟡 Anomalies à corriger**")
+            for r in a_verifier:
+                source = f" *(source : {r['documentRef']})*" if r.get("documentRef") else ""
+                st.markdown(f"🟡 **{r.get('ruleId')}** — {r.get('message')}{source}")
     else:
         st.caption("Aucune non-conformité signalée par le prestataire.")
 
@@ -1979,10 +2001,11 @@ def construire_rapport_excel():
 
         df_regles = pd.DataFrame(
             [
-                {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message")}
+                {"Statut": r.get("status"), "Règle": r.get("ruleId"), "Message": r.get("message"),
+                 "Document source": r.get("documentRef") or ""}
                 for r in non_conformes
             ]
-        ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message"])
+        ) if non_conformes else pd.DataFrame(columns=["Statut", "Règle", "Message", "Document source"])
         df_regles.to_excel(writer, sheet_name="Non-conformités prestataire", index=False)
 
     return buffer.getvalue()
