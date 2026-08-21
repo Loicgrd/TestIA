@@ -32,6 +32,7 @@ from datetime import datetime
 import pytz
 
 import io
+import csv
 import zipfile
 import pandas as pd
 
@@ -297,6 +298,27 @@ def lister_commentaires(numero_dossier):
             .select("id, commentaire, date_ajout, id_analyse_prestataire, "
                     "dossiers_prestataire(date_analyse, date_ajout, reliability_score)")
             .eq("numero_dossier", numero_dossier)
+            .order("date_ajout", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def lister_tous_commentaires():
+    """Tous les commentaires, tous dossiers confondus, avec la date de l'analyse prestataire
+    liée — pour le récapitulatif global téléchargeable (par dossier et par version)."""
+    client = get_supabase_client()
+    if not client:
+        return []
+    try:
+        res = (
+            client.table("commentaires")
+            .select("numero_dossier, commentaire, date_ajout, id_analyse_prestataire, "
+                    "dossiers_prestataire(date_analyse, date_ajout, reliability_score)")
+            .order("numero_dossier")
             .order("date_ajout", desc=True)
             .execute()
         )
@@ -2048,20 +2070,33 @@ if supabase_ok:
                     else:
                         st.error(f"⚠️ {err_del}")
 
-        buffer_commentaires = "\n\n".join(
-            f"[{(c.get('date_ajout') or '')[:10]}] "
-            f"({'analyse du ' + ((c.get('dossiers_prestataire') or {}).get('date_analyse') or (c.get('dossiers_prestataire') or {}).get('date_ajout') or '?')[:10] if c.get('dossiers_prestataire') else 'analyse non identifiée'}) "
-            f"{c['commentaire']}"
-            for c in commentaires_dossier
-        )
-        st.download_button(
-            "📥 Télécharger tous les commentaires de ce dossier",
-            data=f"Commentaires — dossier {numero_pour_commentaire}\n\n{buffer_commentaires}".encode("utf-8"),
-            file_name=f"commentaires_{numero_pour_commentaire}.txt",
-            mime="text/plain",
-        )
     else:
         st.caption("Aucun commentaire enregistré pour ce dossier pour l'instant.")
+
+    tous_commentaires = lister_tous_commentaires()
+    if tous_commentaires:
+        lignes_csv = [["Numéro dossier", "Date commentaire", "Analyse prestataire liée", "Commentaire"]]
+        for c in tous_commentaires:
+            analyse_liee = c.get("dossiers_prestataire")
+            if analyse_liee:
+                date_analyse = (analyse_liee.get("date_analyse") or analyse_liee.get("date_ajout") or "")[:10]
+                libelle_analyse = f"analyse du {date_analyse}"
+            else:
+                libelle_analyse = "non identifiée"
+            lignes_csv.append([
+                c["numero_dossier"],
+                (c.get("date_ajout") or "")[:10],
+                libelle_analyse,
+                c["commentaire"],
+            ])
+        csv_buffer = io.StringIO()
+        csv.writer(csv_buffer, delimiter=";").writerows(lignes_csv)
+        st.download_button(
+            "📥 Télécharger tous les commentaires (tous dossiers)",
+            data=csv_buffer.getvalue().encode("utf-8-sig"),
+            file_name=f"{datetime.now().strftime('%Y-%m-%d')}_commentaires_tous_dossiers.csv",
+            mime="text/csv",
+        )
 
 
 # ─────────────────────────────────────────────
