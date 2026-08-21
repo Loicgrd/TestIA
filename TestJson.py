@@ -713,12 +713,13 @@ def get_odicee_lots_bar(data):
 
 
 # Certains dossiers utilisent un type de document alternatif pour la preuve de réalisation
-# (ex: "CeeInvoice" au lieu de "Invoice", ou "FinalSettlement" — décompte général définitif —
-# sur les marchés publics qui ne produisent pas de facture classique) — parfois même en
-# présence de plusieurs, l'un étant vide côté extraction. On essaie chaque type candidat dans
-# l'ordre et on garde la première valeur non vide trouvée, plutôt que de s'arrêter sur un
-# premier document dont l'extraction a échoué.
-TYPES_ALTERNATIFS = {"Invoice": ["Invoice", "CeeInvoice", "FinalSettlement"]}
+# (ex: "CeeInvoice" au lieu de "Invoice", "FinalSettlement" — décompte général définitif — sur
+# les marchés publics, ou "AcceptanceReport" — PV de réception/levée de réserves — quand il n'y
+# a pas de facture classique) — parfois même en présence de plusieurs, l'un étant vide côté
+# extraction (ex: PVLR vs PVaR). On essaie chaque type candidat dans l'ordre et on garde la
+# première valeur non vide trouvée, plutôt que de s'arrêter sur un premier document dont
+# l'extraction a échoué.
+TYPES_ALTERNATIFS = {"Invoice": ["Invoice", "CeeInvoice", "FinalSettlement", "AcceptanceReport"]}
 
 
 def get_presta_doc_alias(report, doc_type):
@@ -1417,6 +1418,10 @@ doc_engagement = (
     or get_presta_doc(report, "PurchaseOrder")
     or get_presta_doc(report, "ServiceOrder")
     or get_presta_doc(report, "LetterOfCommand")
+    # "Quote" (devis) n'est pas idéal comme preuve d'engagement (c'est une offre, pas un accord
+    # signé) mais certains dossiers n'ont que ça — mieux vaut l'utiliser en dernier recours que
+    # de ne rien détecter du tout.
+    or get_presta_doc(report, "Quote")
 )
 doc_realisation = (
     get_presta_doc_par_regle(report, "DOSSIER_HAS_COMPLETION")
