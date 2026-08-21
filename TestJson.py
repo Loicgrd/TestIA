@@ -1351,34 +1351,45 @@ with tab_fiabilite:
                 colm3.metric("Fiabilité moyenne globale", f"{df_avec_fiab['fiabilite'].mean()*100:.0f}%")
 
             st.markdown("## 2. Évolution par dossier")
-            st.caption(
-                "Chaque colonne = une analyse successive du même dossier (v1 = la plus ancienne). "
-                "Couleur = fiabilité (🔴 faible → 🟢 élevée)."
-            )
             lignes_matrice = {}
             for a in analyses_calculees_fiab:
                 lignes_matrice.setdefault(a["numero_dossier"], []).append(a)
-            max_versions = max((len(v) for v in lignes_matrice.values()), default=0)
-            data_matrice, labels_dossiers = [], []
-            for numero, versions in sorted(lignes_matrice.items()):
-                ligne = [v["fiabilite"] for v in versions] + [None] * (max_versions - len(versions))
-                data_matrice.append(ligne)
-                labels_dossiers.append(f"{numero} ({versions[0].get('fiche') or '?'})")
+            lignes_multi = {k: v for k, v in lignes_matrice.items() if len(v) >= 2}
 
-            if data_matrice:
-                fig_matrice = go.Figure(data=go.Heatmap(
-                    z=data_matrice,
-                    x=[f"v{i+1}" for i in range(max_versions)],
-                    y=labels_dossiers,
-                    colorscale=[[0, "#C0392B"], [0.5, "#F1C40F"], [1, "#27AE60"]],
-                    zmin=0, zmax=1,
-                    text=[[f"{v*100:.0f}%" if v is not None else "" for v in ligne] for ligne in data_matrice],
-                    texttemplate="%{text}",
-                    hovertemplate="%{y}<br>%{x} : %{z:.0%}<extra></extra>",
-                    colorbar=dict(title="Fiabilité", tickformat=".0%"),
-                ))
-                fig_matrice.update_layout(height=max(300, 28 * len(labels_dossiers)), yaxis=dict(autorange="reversed"))
-                st.plotly_chart(fig_matrice, use_container_width=True)
+            if not lignes_multi:
+                st.caption(
+                    "Aucun dossier n'a encore 2 analyses ou plus — rien à montrer en évolution "
+                    "pour l'instant."
+                )
+            else:
+                donnees_evolution = []
+                for numero, versions in sorted(lignes_multi.items()):
+                    fiabs = [v["fiabilite"] for v in versions if v["fiabilite"] is not None]
+                    if len(fiabs) < 2:
+                        continue
+                    donnees_evolution.append({
+                        "Dossier": numero,
+                        "Fiche": versions[0].get("fiche") or "?",
+                        "Versions": len(versions),
+                        "Évolution": fiabs,
+                        "Fiabilité v1": fiabs[0],
+                        "Fiabilité dernière": fiabs[-1],
+                        "Delta (pts)": (fiabs[-1] - fiabs[0]) * 100,
+                    })
+                df_evolution = pd.DataFrame(donnees_evolution).sort_values("Delta (pts)")
+                st.dataframe(
+                    df_evolution,
+                    column_config={
+                        "Évolution": st.column_config.LineChartColumn("Évolution", y_min=0, y_max=1),
+                        "Fiabilité v1": st.column_config.NumberColumn(format="percent"),
+                        "Fiabilité dernière": st.column_config.NumberColumn(format="percent"),
+                        "Delta (pts)": st.column_config.NumberColumn(format="%.0f"),
+                    },
+                    use_container_width=True, hide_index=True,
+                )
+                nb_ignores = len(lignes_matrice) - len(lignes_multi)
+                if nb_ignores:
+                    st.caption(f"{nb_ignores} dossier(s) avec une seule analyse non affiché(s) ici (rien à comparer).")
 
             st.markdown("## 3. 🚨 Régressions détectées")
             st.caption("Dossiers dont la fiabilité a baissé entre les deux dernières analyses.")
