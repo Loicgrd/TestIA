@@ -4,3 +4,4 @@ openpyxl
 pymupdf
 pytesseract
 supabase
+plotly.express
