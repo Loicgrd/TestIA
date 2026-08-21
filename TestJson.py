@@ -264,6 +264,59 @@ def lister_tous_numeros_connus():
     return sorted(numeros)
 
 
+def ajouter_commentaire(numero_dossier, id_analyse, texte):
+    """Ajoute un commentaire libre pour ce dossier, rattaché à une version précise de l'analyse
+    prestataire (peut être None si aucune analyse identifiable pour l'instant). Retourne
+    (succès, message)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase non configuré (secrets absents/invalides ou package non installé)."
+    if not numero_dossier or not texte or not texte.strip():
+        return False, "Numéro de dossier ou commentaire vide."
+    try:
+        client.table("commentaires").insert({
+            "numero_dossier": numero_dossier,
+            "id_analyse_prestataire": id_analyse,
+            "commentaire": texte.strip(),
+        }).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def lister_commentaires(numero_dossier):
+    """Tous les commentaires d'un dossier, du plus récent au plus ancien, avec la date de
+    l'analyse prestataire à laquelle chacun se rattache (pour les distinguer par version)."""
+    client = get_supabase_client()
+    if not client or not numero_dossier:
+        return []
+    try:
+        res = (
+            client.table("commentaires")
+            .select("id, commentaire, date_ajout, id_analyse_prestataire, "
+                    "dossiers_prestataire(date_analyse, date_ajout, reliability_score)")
+            .eq("numero_dossier", numero_dossier)
+            .order("date_ajout", desc=True)
+            .execute()
+        )
+        return res.data or []
+    except Exception:
+        return []
+
+
+def supprimer_commentaire(id_commentaire):
+    """Supprime un commentaire. Retourne (succès, message)."""
+    client = get_supabase_client()
+    if not client:
+        return False, "Supabase non configuré."
+    try:
+        client.table("commentaires").delete().eq("id", id_commentaire).execute()
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
 def charger_analyse_prestataire(id_analyse):
     """Recharge le JSON complet d'une analyse prestataire archivée, par son id. Retourne
     (donnees, message d'erreur ou None)."""
@@ -1164,6 +1217,7 @@ supabase_ok = SUPABASE_DISPONIBLE and get_supabase_client()
 
 data_rechargee = None
 presta_rechargee = None
+id_analyse_active = None  # id Supabase de l'analyse prestataire actuellement affichée (pour les commentaires)
 
 if supabase_ok:
     try:
@@ -1222,6 +1276,7 @@ if supabase_ok:
                         st.warning(f"Prestataire : {err_pr}")
                     elif presta_auto:
                         presta_rechargee = presta_auto
+                        id_analyse_active = version_choisie["id"]
                         c1, c2 = st.columns([5, 1])
                         c1.caption(f"✅ Prestataire chargé ({_libelle_version(version_choisie)}).")
                         if c2.button("🗑️", key="suppr_pr_unifie", help="Supprimer cette version prestataire"):
@@ -1304,6 +1359,12 @@ if fichier_presta and filenumber_presta:
         lister_tous_numeros_connus.clear()
     else:
         st.warning(f"⚠️ Échec de l'enregistrement de l'analyse prestataire dans Supabase : {msg_presta}")
+    if ok_presta and supabase_ok:
+        # Retrouve l'id Supabase de cette analyse (celle qu'on vient d'insérer, ou celle déjà
+        # identique) pour pouvoir y rattacher des commentaires.
+        _historique_maj = lister_historique_prestataire(numero_dossier_presta)
+        if _historique_maj:
+            id_analyse_active = _historique_maj[0]["id"]
 
 # ── Vérification d'identité dossier ──
 st.markdown("### 🪪 Identification du dossier")
@@ -1834,6 +1895,7 @@ def construire_rapport_excel():
                 )
                 ligne_courante += 1
                 export_technique["df"].to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+                ligne_courante += len(export_technique["df"])
             elif export_technique["type"] == "th158":
                 pd.DataFrame([{"Champ": "── Equipements Odicee ──"}]).to_excel(
                     writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
@@ -1859,6 +1921,29 @@ def construire_rapport_excel():
                         "Quantité": [export_technique["total_odicee"], export_technique["total_presta"]],
                     }
                 ).to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
+            ligne_courante += 6
+
+        # ── Commentaires (visuel des problèmes / évolution), en bas du tableau de comparaison ──
+        if supabase_ok:
+            commentaires_export = lister_commentaires(normaliser_numero_dossier(id_odicee))
+            if commentaires_export:
+                pd.DataFrame([{"Champ": "── Commentaires ──"}]).to_excel(
+                    writer, sheet_name=feuille, index=False, header=False, startrow=ligne_courante
+                )
+                ligne_courante += 1
+                df_commentaires = pd.DataFrame([
+                    {
+                        "Date": (c.get("date_ajout") or "")[:10],
+                        "Analyse liée": (
+                            "analyse du " + ((c.get("dossiers_prestataire") or {}).get("date_analyse")
+                                              or (c.get("dossiers_prestataire") or {}).get("date_ajout") or "?")[:10]
+                            if c.get("dossiers_prestataire") else "non identifiée"
+                        ),
+                        "Commentaire": c["commentaire"],
+                    }
+                    for c in commentaires_export
+                ])
+                df_commentaires.to_excel(writer, sheet_name=feuille, index=False, startrow=ligne_courante)
 
         df_regles = pd.DataFrame(
             [
@@ -1907,6 +1992,67 @@ if modifications_odicee:
     with st.expander(f"✏️ {len(modifications_odicee)} modification(s) apportée(s) aux valeurs Odicee"):
         for fiche_mod, cle_mod, avant, apres in modifications_odicee:
             st.caption(f"**{cle_mod}** ({fiche_mod}) : {avant} → {apres}")
+
+
+# ─────────────────────────────────────────────
+# COMMENTAIRES (visuel des problèmes + évolution, par dossier et par version prestataire)
+# ─────────────────────────────────────────────
+
+commentaires_dossier = []
+if supabase_ok:
+    st.markdown("---")
+    st.markdown("## 💬 Commentaires")
+
+    numero_pour_commentaire = normaliser_numero_dossier(id_odicee)
+    nouveau_commentaire = st.text_area(
+        "Ajouter un commentaire sur ce dossier",
+        placeholder="Ex: écart de surface non résolu, à relancer côté prestataire...",
+        key="nouveau_commentaire",
+    )
+    if st.button("💬 Ajouter le commentaire"):
+        ok_com, msg_com = ajouter_commentaire(numero_pour_commentaire, id_analyse_active, nouveau_commentaire)
+        if ok_com:
+            lister_commentaires.clear()
+            st.success("Commentaire ajouté.")
+            st.rerun()
+        else:
+            st.error(f"⚠️ {msg_com}")
+
+    commentaires_dossier = lister_commentaires(numero_pour_commentaire)
+    if commentaires_dossier:
+        with st.expander(f"🗂️ {len(commentaires_dossier)} commentaire(s) enregistré(s) pour ce dossier", expanded=True):
+            for c in commentaires_dossier:
+                analyse_liee = c.get("dossiers_prestataire")
+                if analyse_liee:
+                    date_analyse = (analyse_liee.get("date_analyse") or analyse_liee.get("date_ajout") or "")[:10]
+                    libelle_analyse = f"analyse du {date_analyse}"
+                else:
+                    libelle_analyse = "analyse non identifiée"
+                date_com = (c.get("date_ajout") or "")[:10]
+                cc1, cc2 = st.columns([8, 1])
+                cc1.markdown(f"**{date_com}** *(commentaire sur l'{libelle_analyse})* — {c['commentaire']}")
+                if cc2.button("🗑️", key=f"suppr_com_{c['id']}"):
+                    ok_del, err_del = supprimer_commentaire(c["id"])
+                    if ok_del:
+                        lister_commentaires.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"⚠️ {err_del}")
+
+        buffer_commentaires = "\n\n".join(
+            f"[{(c.get('date_ajout') or '')[:10]}] "
+            f"({'analyse du ' + ((c.get('dossiers_prestataire') or {}).get('date_analyse') or (c.get('dossiers_prestataire') or {}).get('date_ajout') or '?')[:10] if c.get('dossiers_prestataire') else 'analyse non identifiée'}) "
+            f"{c['commentaire']}"
+            for c in commentaires_dossier
+        )
+        st.download_button(
+            "📥 Télécharger tous les commentaires de ce dossier",
+            data=f"Commentaires — dossier {numero_pour_commentaire}\n\n{buffer_commentaires}".encode("utf-8"),
+            file_name=f"commentaires_{numero_pour_commentaire}.txt",
+            mime="text/plain",
+        )
+    else:
+        st.caption("Aucun commentaire enregistré pour ce dossier pour l'instant.")
 
 
 # ─────────────────────────────────────────────
