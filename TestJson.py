@@ -1766,9 +1766,7 @@ with tab_comparateur:
     date_real_presta = (doc_realisation or {}).get("extractedFields", {}).get("documentDate")
     rows_identite.append(("Date de réalisation", date_real_odicee, fmt_date_any(date_real_presta)))
 
-    adresse_fd = " ".join(filter(None, [
-        fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
-    ])) or None
+    adresse_fd = fd.get("adresse_travaux") or None
     adresse_presta, doc_adresse_presta = get_presta_works_address(report, doc_realisation, doc_engagement)
     rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 
@@ -1819,15 +1817,16 @@ with tab_comparateur:
         key=f"editeur_identite_{fiche_odicee_match}_{adresse_site}",
     )
     st.caption(
-        "✏️ Colonne Odicee modifiable. Dates au format JJ/MM/AAAA. L'adresse remplace le champ "
-        "« adresse des travaux » d'Odicee dans son intégralité (code postal/ville restent séparés "
-        "et ne sont pas modifiables ici)."
+        "✏️ Colonne Odicee modifiable. Dates au format JJ/MM/AAAA. L'adresse ne remplace que le "
+        "champ « adresse des travaux » d'Odicee (voie/numéro) ; code postal et ville restent des "
+        "champs séparés dans Odicee et ne sont pas modifiables ici."
     )
     if doc_adresse_presta and doc_realisation and doc_adresse_presta != doc_realisation.get("fileName"):
         st.caption(f"ℹ️ Adresse prestataire trouvée sur **{doc_adresse_presta}** (absente de la facture).")
     if avertissement_installateur:
         st.warning(avertissement_installateur)
 
+    une_modification_identite = False
     for i, label in enumerate(df_identite_edite["Champ"]):
         valeur_orig = lignes_html[i][2]
         valeur_editee = df_identite_edite["Odicee"].iloc[i]
@@ -1838,6 +1837,7 @@ with tab_comparateur:
             if ts is not None:
                 data["dateEngagementReelle"] = ts
                 modifications_odicee.append((fiche_odicee_match, "dateEngagementReelle", valeur_orig, valeur_editee))
+                une_modification_identite = True
             else:
                 st.warning(f"Date d'engagement « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
         elif label == "Date de réalisation":
@@ -1845,18 +1845,28 @@ with tab_comparateur:
             if ts is not None:
                 data["dateRealisationReelle"] = ts
                 modifications_odicee.append((fiche_odicee_match, "dateRealisationReelle", valeur_orig, valeur_editee))
+                une_modification_identite = True
             else:
                 st.warning(f"Date de réalisation « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
         elif label == "Adresse des travaux":
             fd["adresse_travaux"] = valeur_editee
             modifications_odicee.append((fiche_odicee_match, "adresse_travaux", valeur_orig, valeur_editee))
+            une_modification_identite = True
         elif label == "SIRET professionnel":
             titulaire["siret"] = valeur_editee
             modifications_odicee.append((fiche_odicee_match, "professionnelTitulaireSigneQualite.siret", valeur_orig, valeur_editee))
+            une_modification_identite = True
         elif label == "SIRET sous-traitant":
             st_dict = lot.setdefault("professionnelSousTraitant", {})
             st_dict["siret"] = valeur_editee
             modifications_odicee.append((fiche_odicee_match, "professionnelSousTraitant.siret", valeur_orig, valeur_editee))
+            une_modification_identite = True
+
+    if une_modification_identite:
+        # La colonne "Détail écart" et le badge (🟢🔴🟡⚪) sont recalculés à partir de la valeur
+        # Odicee à chaque exécution du script — sans ce rerun, le tableau affiché resterait
+        # figé sur l'ancien résultat de comparaison jusqu'à la prochaine interaction.
+        st.rerun()
 
     # ── Comparaison technique champ par champ ──
     st.markdown("#### 🔧 Données techniques")
@@ -1902,6 +1912,7 @@ with tab_comparateur:
                 "✏️ Colonne Odicee modifiable, sauf marque/référence chaudière et classe régulateur "
                 "(champs composites/à liste déroulante, non réinjectables tels quels ici)."
             )
+            une_modification_th106 = False
             for i, cle_ecriture in enumerate(cles_ecriture_th106):
                 if not cle_ecriture:
                     continue
@@ -1910,7 +1921,10 @@ with tab_comparateur:
                 if str(valeur_editee) != str(valeur_orig_affichee):
                     fd[cle_ecriture] = caster_comme_original(fd.get(cle_ecriture), valeur_editee)
                     modifications_odicee.append((fiche_odicee_match, cle_ecriture, valeur_orig_affichee, valeur_editee))
+                    une_modification_th106 = True
             export_technique = {"type": "table", "titre": "Données techniques", "df": df_th106_edite}
+            if une_modification_th106:
+                st.rerun()
         else:
             st.table(lignes)
             st.caption(
@@ -2094,6 +2108,7 @@ with tab_comparateur:
                         "classe de régulateur... — restent en lecture seule ici)."
                     )
 
+                    une_modification_technique = False
                     for i, cle_od in enumerate(cles_od_lignes):
                         if encode_lignes[i]:
                             continue
@@ -2103,8 +2118,13 @@ with tab_comparateur:
                         if str(valeur_editee) != str(valeur_affichee_orig):
                             fd[cle_od] = caster_comme_original(valeur_originale, valeur_editee)
                             modifications_odicee.append((fiche_odicee_match, cle_od, valeur_affichee_orig, valeur_editee))
+                            une_modification_technique = True
 
                     export_technique = {"type": "table", "titre": "Données techniques", "df": df_edite}
+                    if une_modification_technique:
+                        # Même raison que pour le tableau d'identité : badge et écart affichés
+                        # sont calculés à partir de l'ancienne valeur tant qu'on ne relance pas.
+                        st.rerun()
                 else:
                     st.caption("Aucun champ mappé n'a de correspondance exploitable.")
 
