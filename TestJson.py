@@ -1766,7 +1766,9 @@ with tab_comparateur:
     date_real_presta = (doc_realisation or {}).get("extractedFields", {}).get("documentDate")
     rows_identite.append(("Date de réalisation", date_real_odicee, fmt_date_any(date_real_presta)))
 
-    adresse_fd = fd.get("adresse_travaux") or None
+    adresse_fd = " ".join(filter(None, [
+        fd.get("adresse_travaux", ""), fd.get("code_postal", ""), fd.get("ville", "")
+    ])) or None
     adresse_presta, doc_adresse_presta = get_presta_works_address(report, doc_realisation, doc_engagement)
     rows_identite.append(("Adresse des travaux", adresse_fd, adresse_presta))
 
@@ -1846,7 +1848,18 @@ with tab_comparateur:
             else:
                 st.warning(f"Date de réalisation « {valeur_editee} » non reconnue (attendu JJ/MM/AAAA) — non enregistrée.")
         elif label == "Adresse des travaux":
-            fd["adresse_travaux"] = valeur_editee
+            # La valeur affichée/éditée est "voie + code postal + ville" concaténés (pour rester
+            # comparable à la facture) — on ne réinjecte que la partie voie dans adresse_travaux,
+            # en retirant le suffixe CP/ville déjà connu, sinon il se retrouverait dupliqué au
+            # prochain affichage (code postal/ville ne sont pas modifiables ici).
+            suffixe_cp_ville = " ".join(filter(None, [fd.get("code_postal", ""), fd.get("ville", "")]))
+            if suffixe_cp_ville and valeur_editee.strip().endswith(suffixe_cp_ville):
+                nouvelle_voie = valeur_editee.strip()[: -len(suffixe_cp_ville)].strip()
+            else:
+                # L'utilisateur a modifié/retiré le suffixe attendu : on ne peut pas le séparer
+                # de façon fiable, on enregistre tel quel plutôt que de deviner à tort.
+                nouvelle_voie = valeur_editee.strip()
+            fd["adresse_travaux"] = nouvelle_voie
             modifications_odicee.append((fiche_odicee_match, "adresse_travaux", valeur_orig, valeur_editee))
         elif label == "SIRET professionnel":
             titulaire["siret"] = valeur_editee
