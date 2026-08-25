@@ -2304,13 +2304,22 @@ with tab_comparateur:
         tableaux identité + technique, et — si demandé — les non-conformités du prestataire.
         Les écarts de valeur sont des faits objectifs (déjà vérifiés par l'app) ; les règles de
         non-conformité, elles, nécessitent souvent une vérification humaine sur les pièces
-        avant d'être confirmées comme un vrai problème — d'où la case à cocher séparée."""
+        avant d'être confirmées comme un vrai problème — d'où la case à cocher séparée.
+
+        Un champ n'est listé en "non extrait" que si Odicee a bien une valeur pour ce champ :
+        si Odicee est vide aussi, l'information n'est simplement pas présente sur le dossier —
+        ce n'est pas une extraction manquée côté prestataire, pas la peine de le signaler."""
+        VIDE = (None, "", "—")
+
+        def _absent_mais_odicee_renseigne(v_od):
+            return v_od not in VIDE
+
         non_extraits, ecarts = [], []
         for badge_ident, label, v_od, v_pr, _detail in lignes_html:
-            if badge_ident == "⚪":
+            if badge_ident == "⚪" and _absent_mais_odicee_renseigne(v_od):
                 non_extraits.append(label)
             elif badge_ident == "🔴":
-                ecarts.append(f"{label} (Odicee : {v_od} / Facture : {v_pr})")
+                ecarts.append(f"{label} (Document : {v_od} / Extraction : {v_pr})")
 
         if export_technique and export_technique.get("type") == "table":
             df_tech = export_technique["df"]
@@ -2319,10 +2328,10 @@ with tab_comparateur:
                 badge_t, champ = row.get(""), row.get("Champ")
                 v_od = row.get("Odicee")
                 v_pr = row.get(colonne_facture) if colonne_facture in df_tech.columns else "—"
-                if badge_t == "⚪":
+                if badge_t == "⚪" and _absent_mais_odicee_renseigne(v_od):
                     non_extraits.append(champ)
                 elif badge_t == "🔴":
-                    ecarts.append(f"{champ} (Odicee : {v_od} / Facture : {v_pr})")
+                    ecarts.append(f"{champ} (Document : {v_od} / Extraction : {v_pr})")
 
         def _section(titre, elements):
             lignes_sec = [f"{titre} :"]
