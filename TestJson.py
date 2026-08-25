@@ -2298,16 +2298,70 @@ with tab_comparateur:
     # COMMENTAIRES (visuel des problèmes + évolution, par dossier et par version prestataire)
     # ─────────────────────────────────────────────
 
+    def _construire_modele_commentaire(inclure_regles):
+        """Pré-remplit le modèle de commentaire à partir de ce que l'app a déjà calculé :
+        champs absents (⚪), champs en écart net (🔴, Odicee vs Facture uniquement) sur les
+        tableaux identité + technique, et — si demandé — les non-conformités du prestataire.
+        Les écarts de valeur sont des faits objectifs (déjà vérifiés par l'app) ; les règles de
+        non-conformité, elles, nécessitent souvent une vérification humaine sur les pièces
+        avant d'être confirmées comme un vrai problème — d'où la case à cocher séparée."""
+        non_extraits, ecarts = [], []
+        for badge_ident, label, v_od, v_pr, _detail in lignes_html:
+            if badge_ident == "⚪":
+                non_extraits.append(label)
+            elif badge_ident == "🔴":
+                ecarts.append(f"{label} (Odicee : {v_od} / Facture : {v_pr})")
+
+        if export_technique and export_technique.get("type") == "table":
+            df_tech = export_technique["df"]
+            colonne_facture = LABEL_DOC_TYPE.get("Invoice")
+            for _, row in df_tech.iterrows():
+                badge_t, champ = row.get(""), row.get("Champ")
+                v_od = row.get("Odicee")
+                v_pr = row.get(colonne_facture) if colonne_facture in df_tech.columns else "—"
+                if badge_t == "⚪":
+                    non_extraits.append(champ)
+                elif badge_t == "🔴":
+                    ecarts.append(f"{champ} (Odicee : {v_od} / Facture : {v_pr})")
+
+        def _section(titre, elements):
+            lignes_sec = [f"{titre} :"]
+            lignes_sec += [f"- {e}" for e in elements] if elements else ["- (aucun)"]
+            return lignes_sec
+
+        modele = _section("Éléments non extraits", non_extraits) + [""] + \
+            _section("Éléments extraits mais écart constaté", ecarts)
+
+        if inclure_regles:
+            bloquantes_com = [r for r in non_conformes if r.get("status") == "NonCompliant"]
+            libelles_regles = [f"{r.get('ruleId')} : {r.get('message')}" for r in bloquantes_com]
+            modele += [""] + _section("Règle non respectée", libelles_regles)
+        else:
+            modele += ["", "Règle non respectée :", "- "]
+
+        return "\n".join(modele)
+
     commentaires_dossier = []
     if supabase_ok:
         st.markdown("---")
         st.markdown("## 💬 Commentaires")
 
         numero_pour_commentaire = normaliser_numero_dossier(id_odicee)
+        inclure_regles_commentaire = st.checkbox(
+            "Pré-remplir aussi « Règle non respectée » avec les non-conformités détectées par "
+            "le prestataire",
+            value=False,
+            help="Décoché par défaut : ces règles nécessitent souvent de vérifier les pièces "
+                 "avant de les valider — contrairement aux écarts de valeur ci-dessus, déjà "
+                 "objectivement vérifiés par l'app.",
+            key=f"inclure_regles_{numero_pour_commentaire}_{id_analyse_active}",
+        )
+        modele_commentaire = _construire_modele_commentaire(inclure_regles_commentaire)
         nouveau_commentaire = st.text_area(
             "Ajouter un commentaire sur ce dossier",
-            placeholder="Ex: écart de surface non résolu, à relancer côté prestataire...",
-            key="nouveau_commentaire",
+            value=modele_commentaire,
+            key=f"nouveau_commentaire_{numero_pour_commentaire}_{id_analyse_active}_{inclure_regles_commentaire}",
+            height=220,
         )
         if st.button("💬 Ajouter le commentaire"):
             ok_com, msg_com = ajouter_commentaire(numero_pour_commentaire, id_analyse_active, nouveau_commentaire)
