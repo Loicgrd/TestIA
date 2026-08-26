@@ -1619,12 +1619,12 @@ with tab_comparateur:
     dossier_id = str(data.get("id", ""))
     prefixe = data.get("prefixe", "") or ""
     id_odicee = f"{prefixe}{dossier_id}"
-    id_presta_clean = re.sub(r"^\D+", "", filenumber_presta)
+    id_presta_clean = normaliser_numero_dossier(filenumber_presta)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("N° dossier Odicee", id_odicee)
     c2.metric("N° dossier Prestataire", filenumber_presta or "—")
-    match_id = dossier_id == id_presta_clean
+    match_id = normaliser_numero_dossier(dossier_id) == id_presta_clean
     c3.markdown(f"**Correspondance**\n\n{'🟢 OK' if match_id else '🔴 Écart — vérifier le rapprochement'}")
 
     if dossier_id:
@@ -1649,8 +1649,8 @@ with tab_comparateur:
         )
 
     # ── Historique des analyses prestataire pour ce dossier ──
-    if SUPABASE_DISPONIBLE and get_supabase_client() and filenumber_presta:
-        historique = lister_historique_prestataire(filenumber_presta)
+    if SUPABASE_DISPONIBLE and get_supabase_client() and numero_dossier_presta:
+        historique = lister_historique_prestataire(numero_dossier_presta)
         if len(historique) > 1:
             with st.expander(f"🕓 Historique des analyses prestataire pour {filenumber_presta} ({len(historique)} versions)"):
                 df_hist = pd.DataFrame([
